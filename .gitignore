@@ -30,3 +30,7 @@ tmp/
 
 # 本地模型
 models/
+
+# 測試輸出目錄
+k.audio_output/
+*output/
