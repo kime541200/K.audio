@@ -1,0 +1,36 @@
+services:
+  k_audio_server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: k_audio_server_container
+    ports:
+      - "8000:8000"
+    volumes:
+      # 掛載程式碼 (方便開發)
+      - ./server/app:/app/app
+      # 掛載本地 models 目錄到容器的 /app/models 目錄
+      # 這樣容器就能讀取本地下載的模型檔案了
+      - ./models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # 需要主機安裝 Nvidia Container Toolkit
+            - driver: nvidia
+              # count: 1 # 指定使用 1 個 GPU (若要使用此行，請取消註解並註解掉下面的 count: all)
+              # 或使用所有 GPU
+              count: all
+              # 必須包含 gpu (將註解移到這裡)
+              capabilities: [gpu]
+    environment:
+      # --- STT Settings (保持不變或按需修改) ---
+      - STT_DEVICE=${STT_DEVICE:-cuda}
+      - STT_COMPUTE_TYPE=${STT_COMPUTE_TYPE:-float16}
+      - STT_MODEL_PATH=${STT_MODEL_PATH:-/app/models/faster-whisper-medium}
+      - TZ=Asia/Taipei
+      # --- LLM Settings (在這裡設置您需要的值) ---
+      - LOCAL_LLM_API_BASE=http://192.168.1.103:8001/v1 # <--- 在這裡設置 LLM URL
+      - LOCAL_LLM_MODEL_NAME=cogito-v1-preview-llama-3B # <--- 在這裡設置模型名稱
+      - LOCAL_LLM_API_KEY=${LOCAL_LLM_API_KEY:-DUMMY_KEY} # 可以保持預設或允許外部環境變數覆蓋
+    restart: unless-stopped
