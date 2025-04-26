@@ -25,7 +25,7 @@ Thumbs.db
 *.tmp
 tmp/
 
-# 環境配置檔（儘量另行管理敏感信息）
+# 環境配置檔
 .env
 
 # 本地模型
@@ -34,3 +34,6 @@ models/
 # 測試輸出目錄
 k.audio_output/
 *output/
+
+# Firebase Studio
+.idx/
