@@ -3,11 +3,13 @@ import websockets
 import sounddevice as sd
 import numpy as np
 import argparse
-import json # 用於解析伺服器訊息
+import json
 import logging
-import httpx # <--- 新增導入 httpx
-from pathlib import Path # <--- 用於處理路徑
-from datetime import datetime # <--- 用於生成時間戳
+import httpx
+from pathlib import Path
+from datetime import datetime
+from rich.console import Console # <--- 導入 Rich Console
+from rich.text import Text      # <--- 導入 Rich Text (可選，用於更精確控制樣式)
 
 # --- 基本設定 ---
 logging.basicConfig(
@@ -15,6 +17,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
+console = Console() # <--- 創建 Console 實例
 
 # --- 音訊參數 (必須與伺服器 stt_service.py 中的設置匹配) ---
 SAMPLE_RATE = 16000
@@ -113,11 +116,33 @@ async def receiver(websocket):
         async for message in websocket:
             try:
                 data = json.loads(message)
-                logger.info(f"Received from server: {data}")
+                # logger.info(f"Received from server: {data}") # 可以註解掉，用下面的彩色輸出替代
 
-                # *** 累積 'final' 類型的文本 ***
-                if data.get("type") == "final" and "text" in data:
-                    transcript_parts.append(data["text"]) # 將最終文本添加到列表中
+                msg_type = data.get("type")
+
+                if msg_type == "final":
+                    text = data.get("text", "")
+                    lang = data.get("language", "unk")
+                    # 使用 Rich 打印帶顏色的文字稿
+                    console.print(f"[green]Transcript ({lang}):[/green] {text}")
+                    transcript_parts.append(text)
+                elif msg_type == "translation":
+                    original = data.get("original_text", "") # 包含原文以便對照
+                    translated = data.get("translated_text", "")
+                    source = data.get("source_lang", "?")
+                    target = data.get("target_lang", "?")
+                    # 使用 Rich 打印帶顏色的翻譯結果
+                    console.print(f"[cyan]Translation ({source}->{target}):[/cyan] {translated}")
+                    # 可以選擇是否打印原文: console.print(f"  [grey50]Original: {original}[/grey50]")
+                elif msg_type == "info":
+                    # 可以用不那麼醒目的顏色打印 info
+                    console.print(f"[yellow]Info:[/yellow] {data.get('message', '')}")
+                elif msg_type == "error":
+                    console.print(f"[bold red]Error:[/bold red] {data.get('message', 'Unknown server error')}")
+                else:
+                    # 其他未知類型
+                    logger.warning(f"Received unknown message type: {data}")
+                    console.print(f"[grey]Unknown message: {data}[/grey]")
 
             except json.JSONDecodeError:
                 logger.warning(f"Received non-JSON message: {message}")
@@ -215,22 +240,34 @@ async def main(args):
         logger.error(f"Error querying audio devices: {e}", exc_info=True)
         return
 
-    # 2. 構建 WebSocket URL (包含查詢參數)
-    # ws://<host>:<port>/v1/audio/transcriptions/ws?language=zh&prompt=...
+    # --- 修改：構建 WebSocket URL (添加翻譯參數) ---
     connect_url = args.server_url
     query_params = []
     if args.language:
         query_params.append(f"language={args.language}")
     if args.prompt:
         query_params.append(f"prompt={args.prompt}")
+    # 添加翻譯參數
+    if args.translate:
+        query_params.append("translate=true")
+        if args.target_lang:
+             query_params.append(f"target_lang={args.target_lang}")
+        else:
+             # 如果啟用翻譯但未指定目標語言，則報錯退出
+             logger.error("Error: --target-lang is required when --translate is enabled.")
+             return # 或者 raise ValueError
+        if args.source_lang:
+            query_params.append(f"source_lang={args.source_lang}")
+
     if query_params:
         connect_url += "?" + "&".join(query_params)
-    logger.info(f"Connecting to WebSocket: {connect_url}")
+    logger.info(f"Connecting to WebSocket: {connect_url}") # 現在會顯示完整的 URL
 
-    # --- 使用命令行參數指定的輸出目錄 ---
-    output_dir = Path(args.output_dir) # <--- 使用 args.output_dir
+    # 使用命令行參數指定的輸出目錄
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True) # parents=True 允許創建多級目錄
 
+    # WebSocket 連接與運行
     websocket_connection = None
     stream = None
     sender_task = None
@@ -307,43 +344,35 @@ async def main(args):
 
         # --- 文字稿處理和摘要請求 ---
         if transcript_parts:
-            # *** 修改點：使用換行符連接 ***
             full_transcript = "\n".join(transcript_parts)
-            
-            # *** 修改點：創建會話子目錄 ***
-            session_dir = output_dir / session_timestamp
+            session_dir = output_dir / session_timestamp # <--- 確保 session_dir 在這裡被賦值
             session_dir.mkdir(exist_ok=True)
-            
-            # *** 修改點：在會話子目錄中保存文件 ***
-            transcript_file_path = session_dir / "transcript.txt" # 固定文件名
+            transcript_file_path = session_dir / "transcript.txt"
 
             try:
+                # 保存 transcript.txt
                 with open(transcript_file_path, "w", encoding="utf-8") as f:
                     f.write(full_transcript)
                 logger.info(f"Transcript saved to: {transcript_file_path}")
 
                 # 詢問用戶是否總結
                 summarize_choice = input("Summarize this transcript? (y/n): ").lower()
-
                 if summarize_choice == 'y':
+                    # 從 WS URL 推斷 HTTP URL
                     server_http_url = args.server_url.replace("ws://", "http://").split('/v1/audio/transcriptions/ws')[0]
                     summary_text = await request_summarization(server_http_url, full_transcript)
-
                     if summary_text:
-                        print("\n--- Summary ---")
-                        print(summary_text)
-                        print("---------------")
-                        
-                        # *** 修改點：在會話子目錄中保存摘要 ***
-                        summary_file_path = session_dir / "summary.txt" # 固定文件名
+                        console.print("\n--- Summary ---", style="bold magenta") # 使用 console 打印
+                        console.print(summary_text)
+                        console.print("---------------", style="bold magenta")
+                        summary_file_path = session_dir / "summary.txt"
                         try:
-                            with open(summary_file_path, "w", encoding="utf-8") as f:
-                                f.write(summary_text)
+                            # ... (保存 summary.txt) ...
+                            with open(summary_file_path, "w", encoding="utf-8") as f: f.write(summary_text)
                             logger.info(f"Summary saved to: {summary_file_path}")
-                        except IOError as e:
-                            logger.error(f"Failed to save summary file: {e}")
+                        except IOError as e: logger.error(f"Failed to save summary file: {e}")
                     else:
-                        print("Failed to retrieve summary.")
+                        console.print("Failed to retrieve summary.", style="bold red")
             except IOError as e:
                 logger.error(f"Failed to save transcript file: {e}")
             except Exception as e: # 捕獲 input() 可能的異常
@@ -378,7 +407,7 @@ if __name__ == "__main__":
         "-p", "--prompt",
         type=str,
         default=None,
-        help="Optional initial prompt for the model."
+        help="Optional initial prompt for the model.(Only available for non-streaming mode)"
     )
     parser.add_argument(
         "-o", "--output-dir",
@@ -386,22 +415,39 @@ if __name__ == "__main__":
         default="./k.audio_output", # 設置默認值
         help="Directory to save transcript and summary files."
     )
+    # --- 新增：翻譯相關參數 ---
+    parser.add_argument(
+        "--translate",
+        action="store_true", # 設置此標誌即表示啟用
+        help="Enable real-time translation."
+    )
+    parser.add_argument(
+        "--target-lang",
+        type=str,
+        default=None,
+        help="Target language code for translation (e.g., 'en', 'ja'). Required if --translate is set."
+    )
+    parser.add_argument(
+        "--source-lang",
+        type=str,
+        default=None,
+        help="Source language code for translation (optional, overrides Whisper detection)."
+    )
+
     args = parser.parse_args()
 
+    # 檢查參數依賴
     if args.server_url is None and args.device != 'list':
          parser.error("the following arguments are required: server_url (unless using --device list)")
+    if args.translate and not args.target_lang:
+        parser.error("--target-lang is required when --translate is enabled")
 
-    # --- 修改: 使用 asyncio.run() 來運行 ---
-    # asyncio.run() 會自動處理事件循環的創建和關閉
-    # 並能更好地處理 KeyboardInterrupt
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received. Exiting...")
-        # asyncio.run() 會處理清理工作，但確保 stop_event 被設置很重要
         stop_event.set()
     except Exception as e:
          logger.critical(f"Unhandled exception in main execution: {e}", exc_info=True)
 
-    # 在 asyncio.run() 之後，事件循環已關閉
     logger.info("Application finished.")

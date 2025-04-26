@@ -31,6 +31,6 @@ services:
       - TZ=Asia/Taipei
       # --- LLM Settings (在這裡設置您需要的值) ---
       - LOCAL_LLM_API_BASE=http://192.168.1.103:8001/v1 # <--- 在這裡設置 LLM URL
-      - LOCAL_LLM_MODEL_NAME=cogito-v1-preview-llama-3B # <--- 在這裡設置模型名稱
+      - LOCAL_LLM_MODEL_NAME=cogito-v1-preview-llama-3B-Q8_0 # <--- 在這裡設置模型名稱
       - LOCAL_LLM_API_KEY=${LOCAL_LLM_API_KEY:-DUMMY_KEY} # 可以保持預設或允許外部環境變數覆蓋
     restart: unless-stopped

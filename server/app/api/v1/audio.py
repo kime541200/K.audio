@@ -1,21 +1,22 @@
 import asyncio
 from fastapi import (
     APIRouter, UploadFile, File, Form, HTTPException,
-    Depends, Request, WebSocket, WebSocketDisconnect
-) # 添加 WebSocket, WebSocketDisconnect
+    Depends, Request, WebSocket, WebSocketDisconnect, Query
+)
 from fastapi.responses import JSONResponse, PlainTextResponse
 import srt
 import logging
 from typing import Literal, Dict, Any
 from datetime import timedelta
-import numpy as np # 確保導入 numpy
+import numpy as np
 
 # 導入流式處理類和非流式函數
 from ...services.stt_service import (
     transcribe_audio_file,
-    AudioTranscriptionStreamer, # 導入流式處理類
-    stt_model # 雖然 streamer 內部使用，但這裡可能不需要直接導入了
+    AudioTranscriptionStreamer,
 )
+# --- 導入翻譯服務 ---
+from ...services import summary_service # 現在包含翻譯函數
 from ...core.config import settings
 
 router = APIRouter(
@@ -127,20 +128,58 @@ async def websocket_transcription_endpoint(
     websocket: WebSocket,
     language: str | None = None, # 可以通過查詢參數傳遞配置
     prompt: str | None = None,
+    # --- 新增：翻譯相關參數 ---
+    translate: bool = Query(False, description="是否啟用即時翻譯功能。"),
+    target_lang: str | None = Query(None, description="目標翻譯語言代碼 (例如 'en', 'ja')。啟用翻譯時必需。"),
+    source_lang: str | None = Query(None, description="源語言代碼 (可選，若不指定則使用 Whisper 檢測結果)。")
 ):
     await websocket.accept()
     logger.info(f"WebSocket connection accepted from {websocket.client.host}:{websocket.client.port}")
+    logger.info(f"Connection options: language='{language}', prompt='{prompt}', translate={translate}, target_lang='{target_lang}', source_lang='{source_lang}'")
 
-    # 檢查模型是否已加載
-    # 注意：WebSocket 沒有 request.app，需要找到 app 實例
-    # 一個方法是通過依賴注入，或者如果 app 在全局可訪問
-    # 暫時依賴 lifespan 中設置的狀態 (假設 app.state 可用)
-    # 更健壯的方式是使用 Depends()
+    # 檢查模型是否加載
     model_loaded = getattr(websocket.app.state, 'stt_model_loaded', False)
     if not model_loaded:
+        # ... (處理模型未加載錯誤) ...
         logger.error("WebSocket connection attempt but STT model not loaded.")
-        await websocket.close(code=1011, reason="STT service is not available") # 1011 = Internal Error
+        await websocket.close(code=1011, reason="STT service is not available")
         return
+
+    # 檢查翻譯參數
+    if translate and not target_lang:
+        logger.error("Translation enabled but target_lang not specified.")
+        await websocket.close(code=1008, reason="target_lang is required when translate=true") # 1008 = Policy Violation
+        return
+    
+
+    # --- 新增：異步輔助函數，用於執行翻譯並發送結果 ---
+    async def translate_and_send(text: str, detected_source_lang: str):
+        lang_to_use = source_lang or detected_source_lang # 優先使用客戶端指定的源語言
+        if not lang_to_use:
+            logger.warning("Cannot perform translation: source language not specified and not detected.")
+            return # 無法確定源語言
+
+        logger.info(f"Requesting translation for segment: '{text[:30]}...' from {lang_to_use} to {target_lang}")
+        translation = await summary_service.get_translation_from_llm(text, lang_to_use, target_lang)
+
+        if translation:
+            try:
+                await websocket.send_json({
+                    "type": "translation",
+                    "original_text": text,
+                    "translated_text": translation,
+                    "source_lang": lang_to_use,
+                    "target_lang": target_lang
+                })
+                logger.info("Translation sent to client.")
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("Could not send translation, connection closed.")
+            except Exception as e:
+                logger.error(f"Error sending translation to client: {e}", exc_info=True)
+        else:
+             logger.warning("Translation failed or returned empty.")
+             # 可以選擇是否發送錯誤訊息給客戶端
+             # await websocket.send_json({"type": "error", "message": "Translation failed"})
 
     try:
         # 創建流式處理器實例
@@ -155,34 +194,54 @@ async def websocket_transcription_endpoint(
 
                 if "bytes" in data:
                     chunk = data["bytes"]
-                    #logger.debug(f"Received {len(chunk)} bytes of audio data.")
-                    # 將音訊塊交給 streamer 處理，並將結果發回客戶端
+                    # 處理音訊塊並獲取結果
                     async for result in streamer.process_audio_chunk(chunk):
+                        # **首先發送原始結果 (final/info/error)**
                         await websocket.send_json(result)
 
+                        # **如果結果是 final 且啟用了翻譯，則觸發翻譯任務**
+                        if result.get("type") == "final" and translate:
+                            original_text = result.get("text")
+                            detected_lang = result.get("language") # Whisper 檢測到的語言
+                            if original_text and target_lang: # 確保有文本和目標語言
+                                # *** 創建一個異步任務來處理翻譯，不阻塞主循環 ***
+                                asyncio.create_task(translate_and_send(original_text, detected_lang))
+                            elif not target_lang:
+                                # 這不應該發生，因為前面檢查過了
+                                logger.warning("Translation enabled but target_lang is missing.")
+
+
                 elif "text" in data:
+                    # ... (處理 STREAM_END 等文本消息 - 保持不變) ...
                     message = data["text"]
                     logger.info(f"Received text message: {message}")
-                    if message == "STREAM_END": # 約定一個結束信號
+                    if message == "STREAM_END":
                         logger.info("Received stream end signal.")
-                        break # 退出接收循環
+                        break
                     else:
-                         # 可以處理其他控制訊息
                          await websocket.send_json({"type": "info", "message": f"Received unknown text message: {message}"})
 
             except WebSocketDisconnect:
                 logger.info(f"WebSocket disconnected by client {websocket.client.host}:{websocket.client.port}")
-                break # 退出接收循環
+                break
             except Exception as e:
-                 logger.error(f"Error during WebSocket communication: {e}", exc_info=True)
-                 # 嘗試發送錯誤訊息給客戶端
-                 await websocket.send_json({"type": "error", "message": f"Server error: {e}"})
-                 break # 發生錯誤，退出循環
+                 logger.error(f"Error during WebSocket communication loop: {e}", exc_info=True)
+                 try: # 嘗試發送錯誤
+                     await websocket.send_json({"type": "error", "message": f"Server processing error: {e}"})
+                 except: pass
+                 break
 
         # WebSocket 接收循環結束 (客戶端斷開或收到結束信號)
         logger.info("Processing any remaining audio in buffer...")
         async for result in streamer.stream_complete():
             await websocket.send_json(result)
+            # 如果最後一段也需要翻譯
+            if result.get("type") == "final" and translate:
+                original_text = result.get("text")
+                detected_lang = result.get("language")
+                if original_text and target_lang:
+                    asyncio.create_task(translate_and_send(original_text, detected_lang))
+
 
         logger.info("Closing WebSocket connection.")
         await websocket.close()

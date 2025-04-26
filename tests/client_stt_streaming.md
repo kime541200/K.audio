@@ -43,3 +43,15 @@ python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/trans
 ```bash
 python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/transcriptions/ws --output-dir ./output
 ```
+
+## Enable streaming translate
+
+```bash
+python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/transcriptions/ws --translate --target-lang en
+```
+
+set source language and target language
+
+```bash
+python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/transcriptions/ws --translate --target-lang en --source-lang zh
+```

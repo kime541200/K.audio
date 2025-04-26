@@ -158,7 +158,7 @@ class AudioTranscriptionStreamer:
 
             transcribe_options = {
                 "language": self.language,
-                "initial_prompt": self.initial_prompt,
+                # "initial_prompt": self.initial_prompt,
                 # "word_timestamps": False, # 流式傳輸通常不需要詞級時間戳
                 # 在流式中，VAD 判斷已經在外部完成，這裡可以關閉內部 VAD filter
                 # "vad_filter": False,
