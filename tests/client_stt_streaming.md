@@ -37,3 +37,9 @@ python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/trans
 ```bash
 python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/transcriptions/ws --language zh
 ```
+
+## Specify output directory
+
+```bash
+python client/python/stt_stream_client.py ws://192.168.1.103:8000/v1/audio/transcriptions/ws --output-dir ./output
+```

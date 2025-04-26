@@ -5,6 +5,9 @@ import numpy as np
 import argparse
 import json # 用於解析伺服器訊息
 import logging
+import httpx # <--- 新增導入 httpx
+from pathlib import Path # <--- 用於處理路徑
+from datetime import datetime # <--- 用於生成時間戳
 
 # --- 基本設定 ---
 logging.basicConfig(
@@ -28,6 +31,10 @@ BLOCK_SIZE = SAMPLES_PER_FRAME
 audio_queue = asyncio.Queue()
 # 用於通知發送任務停止的事件
 stop_event = asyncio.Event()
+# 用於累積文字稿的列表
+transcript_parts = []
+# 保存文字稿的文件路徑
+# transcript_file_path: Path | None = None
 
 # --- sounddevice 回調函數 ---
 def audio_callback(indata, frames, time, status):
@@ -57,6 +64,7 @@ def audio_callback(indata, frames, time, status):
         audio_queue.put_nowait(indata.tobytes())
     except asyncio.QueueFull:
         logger.warning("Audio queue is full, dropping frame.")
+
 
 # --- 異步任務：發送音訊數據 ---
 async def sender(websocket):
@@ -96,20 +104,20 @@ async def sender(websocket):
 
 # --- 異步任務：接收伺服器訊息 ---
 async def receiver(websocket):
-    """接收並打印伺服器發來的 JSON 訊息"""
+    """接收伺服器訊息，打印並累積最終文字稿"""
     logger.info("Receiver task started.")
+    global transcript_parts # 聲明我們要修改全局列表
+    transcript_parts.clear() # 確保每次運行前清空
+
     try:
         async for message in websocket:
             try:
                 data = json.loads(message)
                 logger.info(f"Received from server: {data}")
-                # 在這裡可以根據 data['type'] 做更詳細的處理
-                # if data.get("type") == "final":
-                #     print(f"Final Transcription: {data.get('text')}")
-                # elif data.get("type") == "info":
-                #     print(f"Info: {data.get('message')}")
-                # elif data.get("type") == "error":
-                #     print(f"Error: {data.get('message')}")
+
+                # *** 累積 'final' 類型的文本 ***
+                if data.get("type") == "final" and "text" in data:
+                    transcript_parts.append(data["text"]) # 將最終文本添加到列表中
 
             except json.JSONDecodeError:
                 logger.warning(f"Received non-JSON message: {message}")
@@ -129,9 +137,45 @@ async def receiver(websocket):
          logger.info("Receiver task finished.")
 
 
+# --- 調用總結 API 的函數 ---
+async def request_summarization(server_http_url: str, text: str) -> str | None:
+    """向 K.audio 伺服器請求文本摘要"""
+    summarization_url = f"{server_http_url}/v1/summarizations" # 構造 URL
+    logger.info(f"Requesting summarization from: {summarization_url}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                summarization_url,
+                json={"text": text},
+                headers={"Content-Type": "application/json", "accept": "application/json"},
+                timeout=120.0 # 給 LLM 調用留足夠的時間 (例如 120 秒)
+            )
+
+            response.raise_for_status() # 如果狀態碼不是 2xx，則拋出異常
+
+            result = response.json()
+            if "summary" in result:
+                logger.info("Summarization successful.")
+                return result["summary"]
+            else:
+                logger.error(f"Summarization response missing 'summary' key: {result}")
+                return None
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error during summarization request: {e.response.status_code} - {e.response.text}")
+        return None
+    except httpx.RequestError as e:
+        logger.error(f"Request error during summarization request: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during summarization request: {e}", exc_info=True)
+        return None
+
 # --- 主函數 ---
 async def main(args):
     """主執行函數"""
+    global transcript_file_path # 允許修改全局變數
 
     # 1. 選擇音訊設備
     try:
@@ -183,36 +227,36 @@ async def main(args):
         connect_url += "?" + "&".join(query_params)
     logger.info(f"Connecting to WebSocket: {connect_url}")
 
+    # --- 使用命令行參數指定的輸出目錄 ---
+    output_dir = Path(args.output_dir) # <--- 使用 args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True) # parents=True 允許創建多級目錄
 
-    # 3. 建立 WebSocket 連接並運行任務
+    websocket_connection = None
+    stream = None
+    sender_task = None
+    receiver_task = None
+    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") # <--- 生成會話時間戳
+    session_dir: Path | None = None # <--- 用於存放本次會話文件的目錄
+
     try:
         async with websockets.connect(connect_url) as websocket:
+            websocket_connection = websocket # 保存引用
             logger.info("WebSocket connection established.")
 
-            # 啟動 sounddevice 輸入流
             stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCK_SIZE,
-                device=device_index,
-                channels=CHANNELS,
-                dtype=DTYPE,
-                callback=audio_callback
+                samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
+                device=device_index, channels=CHANNELS,
+                dtype=DTYPE, callback=audio_callback
             )
             stream.start()
             logger.info("Audio input stream started.")
 
-            # 運行 sender 和 receiver 任務
             sender_task = asyncio.create_task(sender(websocket))
             receiver_task = asyncio.create_task(receiver(websocket))
 
-            # 等待任務完成 (或被中斷)
-            # 我們需要一種方式來停止，例如監聽 Ctrl+C
-            # asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop_event.set) # Linux/macOS
-            
-            # 簡單的等待停止事件被設置
+            # 等待停止事件 (例如 Ctrl+C)
             await stop_event.wait()
             logger.info("Stop event received.")
-
 
     except websockets.exceptions.InvalidURI:
         logger.error(f"Invalid WebSocket URI: {connect_url}")
@@ -221,34 +265,92 @@ async def main(args):
     except sd.PortAudioError as e:
          logger.error(f"PortAudio error starting stream: {e}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+        logger.error(f"An unexpected error occurred during main execution: {e}", exc_info=True)
     finally:
-        # 無論如何都要嘗試停止流和任務
-        if 'stream' in locals() and stream.active:
+        # --- 清理與結束流程 ---
+        logger.info("Starting cleanup...")
+        if stream and stream.active:
             stream.stop()
             stream.close()
             logger.info("Audio input stream stopped.")
-        
-        stop_event.set() # 確保事件被設置以停止 sender
-        
-        # 等待 sender 完成 (給它一點時間發送 STREAM_END)
-        if 'sender_task' in locals() and not sender_task.done():
+
+        stop_event.set() # 確保事件被設置
+
+        if sender_task and not sender_task.done():
             try:
+                logger.info("Waiting for sender task to finish...")
                 await asyncio.wait_for(sender_task, timeout=2.0)
             except asyncio.TimeoutError:
-                logger.warning("Sender task did not finish gracefully.")
+                logger.warning("Sender task did not finish sending STREAM_END gracefully.")
             except Exception as e:
-                logger.error(f"Error waiting for sender task: {e}")
+                 logger.error(f"Error waiting for sender task completion: {e}")
 
-        # 取消 receiver (如果它還在運行)
-        if 'receiver_task' in locals() and not receiver_task.done():
+        # WebSocket 關閉應該由 websockets.connect() 的上下文管理器處理，
+        # 但如果提前退出或出錯，最好還是嘗試關閉
+        # if websocket_connection and not websocket_connection.closed:
+        #     try:
+        #         await websocket_connection.close()
+        #         logger.info("WebSocket connection closed.")
+        #     except Exception as e:
+        #         logger.warning(f"Error closing WebSocket connection during cleanup: {e}")
+
+
+        if receiver_task and not receiver_task.done():
+             logger.info("Cancelling receiver task...")
              receiver_task.cancel()
              try:
                  await receiver_task
              except asyncio.CancelledError:
                  logger.info("Receiver task cancelled successfully.")
              except Exception as e:
-                logger.error(f"Error waiting for receiver task cancellation: {e}")
+                 logger.error(f"Error waiting for receiver task cancellation: {e}")
+
+        # --- 文字稿處理和摘要請求 ---
+        if transcript_parts:
+            # *** 修改點：使用換行符連接 ***
+            full_transcript = "\n".join(transcript_parts)
+            
+            # *** 修改點：創建會話子目錄 ***
+            session_dir = output_dir / session_timestamp
+            session_dir.mkdir(exist_ok=True)
+            
+            # *** 修改點：在會話子目錄中保存文件 ***
+            transcript_file_path = session_dir / "transcript.txt" # 固定文件名
+
+            try:
+                with open(transcript_file_path, "w", encoding="utf-8") as f:
+                    f.write(full_transcript)
+                logger.info(f"Transcript saved to: {transcript_file_path}")
+
+                # 詢問用戶是否總結
+                summarize_choice = input("Summarize this transcript? (y/n): ").lower()
+
+                if summarize_choice == 'y':
+                    server_http_url = args.server_url.replace("ws://", "http://").split('/v1/audio/transcriptions/ws')[0]
+                    summary_text = await request_summarization(server_http_url, full_transcript)
+
+                    if summary_text:
+                        print("\n--- Summary ---")
+                        print(summary_text)
+                        print("---------------")
+                        
+                        # *** 修改點：在會話子目錄中保存摘要 ***
+                        summary_file_path = session_dir / "summary.txt" # 固定文件名
+                        try:
+                            with open(summary_file_path, "w", encoding="utf-8") as f:
+                                f.write(summary_text)
+                            logger.info(f"Summary saved to: {summary_file_path}")
+                        except IOError as e:
+                            logger.error(f"Failed to save summary file: {e}")
+                    else:
+                        print("Failed to retrieve summary.")
+            except IOError as e:
+                logger.error(f"Failed to save transcript file: {e}")
+            except Exception as e: # 捕獲 input() 可能的異常
+                 logger.error(f"Error during summarization prompt/request: {e}", exc_info=True)
+
+        else:
+            logger.info("No transcript parts were recorded.")
 
         logger.info("Client shutdown complete.")
 
@@ -278,30 +380,28 @@ if __name__ == "__main__":
         default=None,
         help="Optional initial prompt for the model."
     )
+    parser.add_argument(
+        "-o", "--output-dir",
+        type=str,
+        default="./k.audio_output", # 設置默認值
+        help="Directory to save transcript and summary files."
+    )
     args = parser.parse_args()
 
     if args.server_url is None and args.device != 'list':
          parser.error("the following arguments are required: server_url (unless using --device list)")
 
-    # 處理 Ctrl+C
-    loop = asyncio.get_event_loop()
+    # --- 修改: 使用 asyncio.run() 來運行 ---
+    # asyncio.run() 會自動處理事件循環的創建和關閉
+    # 並能更好地處理 KeyboardInterrupt
     try:
-        # 註冊信號處理器來設置停止事件
-        # loop.add_signal_handler(signal.SIGINT, stop_event.set)
-        # loop.add_signal_handler(signal.SIGTERM, stop_event.set)
-        # Windows 上 add_signal_handler 可能不完全支援，使用 asyncio.run 的 shutdown_default_executor
-        # 更簡單的方式是讓用戶手動按 Ctrl+C，asyncio 會引發 KeyboardInterrupt
-        
-        # 啟動主異步函數
-        loop.run_until_complete(main(args))
-
+        asyncio.run(main(args))
     except KeyboardInterrupt:
-        logger.info("Ctrl+C detected. Stopping client...")
+        logger.info("KeyboardInterrupt received. Exiting...")
+        # asyncio.run() 會處理清理工作，但確保 stop_event 被設置很重要
         stop_event.set()
-        # 在這裡再次調用 run_until_complete 可能會導致問題
-        # main 函數的 finally 塊應該處理清理
-        # 給 finally 塊一點時間執行
-        # loop.run_until_complete(asyncio.sleep(1)) # 可能不需要
-    finally:
-        # loop.close() # 在 run_until_complete 後通常不需要手動關閉
-        logger.info("Event loop finished.")
+    except Exception as e:
+         logger.critical(f"Unhandled exception in main execution: {e}", exc_info=True)
+
+    # 在 asyncio.run() 之後，事件循環已關閉
+    logger.info("Application finished.")
