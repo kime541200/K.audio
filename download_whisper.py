@@ -4,14 +4,21 @@ import os
 import shutil # 用於檔案複製
 import glob   # 用於尋找 snapshot 目錄
 
+# --- 修改開始: 更新 VALID_MODELS ---
 VALID_MODELS = {
-    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
-    "medium", "medium.en", "large-v1", "large-v2", "large-v3",
-    "distil-small.en", "distil-medium.en", "distil-large-v2" # 加入更多有效模型
+    "tiny", "tiny.en",
+    "base", "base.en",
+    "small", "small.en",
+    "medium", "medium.en",
+    "large-v1", "large-v2", "large-v3",
+    "distil-small.en", "distil-medium.en", "distil-large-v2", "distil-large-v3" # 加入圖片中所有模型
 }
+# --- 修改結束 ---
 
+# --- 修改開始: 更新 MODEL_OWNER_MAP ---
 # Hugging Face 上的 Repo Owner (通常是 Systran 或 openai)
 # faster-whisper 預設使用 Systran 的版本
+# 根據圖片，這些模型都來自 Systran
 MODEL_OWNER_MAP = {
     "tiny": "Systran", "tiny.en": "Systran",
     "base": "Systran", "base.en": "Systran",
@@ -19,10 +26,12 @@ MODEL_OWNER_MAP = {
     "medium": "Systran", "medium.en": "Systran",
     "large-v1": "Systran", "large-v2": "Systran", "large-v3": "Systran",
     "distil-small.en": "Systran", "distil-medium.en": "Systran",
-    "distil-large-v2": "Systran",
+    "distil-large-v2": "Systran", "distil-large-v3": "Systran", # 加入 distil-large-v3
     # 如果未來 faster-whisper 改用 openai 或其他來源，可以在這裡更新
     # "large-v3": "openai" # 範例
 }
+# --- 修改結束 ---
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -32,7 +41,8 @@ def main():
     parser.add_argument(
         "models",
         type=str,
-        help=f"用逗號分隔要下載的模型列表，有效選項包含： {', '.join(sorted(VALID_MODELS))}"
+        # 使用更新後的 VALID_MODELS 產生說明文字
+        help=f"用逗號分隔要下載的模型列表，有效選項包含： {', '.join(sorted(list(VALID_MODELS)))}"
     )
     parser.add_argument(
         "--download_root",
@@ -57,7 +67,8 @@ def main():
     invalid = [m for m in model_names if m not in VALID_MODELS]
     if invalid:
         print(f"錯誤: 無效的模型名稱 {', '.join(invalid)}")
-        print(f"有效選項：{', '.join(sorted(VALID_MODELS))}")
+        # 使用更新後的 VALID_MODELS 產生有效選項列表
+        print(f"有效選項：{', '.join(sorted(list(VALID_MODELS)))}")
         return 1
 
     device = "cpu" if args.force_cpu else "auto"
@@ -69,6 +80,8 @@ def main():
 
     for model_name in model_names:
         model = None # 初始化 model 變數
+        cache_model_dir = None # 初始化快取目錄路徑
+        hf_repo_name = None # 初始化找到的 repo name
         try:
             print(f"\n--- 處理模型：{model_name} ---")
 
@@ -84,30 +97,41 @@ def main():
 
             # 2. 找到 Hugging Face 快取中的 snapshot 目錄
             print("步驟 2: 尋找快取中的模型文件...")
+            # 使用更新後的 MODEL_OWNER_MAP
             owner = MODEL_OWNER_MAP.get(model_name, "Systran") # 預設用 Systran
-            # 注意：HuggingFace 上的模型名稱可能包含 '.'，但在快取目錄中通常會被替換
-            # 但 faster-whisper 可能內部有處理，我們先嘗試直接用 model_name
-            # 快取目錄的命名規則通常是 models--{owner}--{repo_name}
-            # faster-whisper 內部使用的 repo name 通常是 faster-whisper-{model_name}
-            hf_repo_name = f"faster-whisper-{model_name}"
-            cache_model_dir_pattern = os.path.join(cache_dir, f"models--{owner}--{hf_repo_name}")
 
-            # 檢查快取目錄是否存在
-            matching_dirs = glob.glob(cache_model_dir_pattern)
+            # 構建可能的 Hugging Face 儲存庫名稱列表
+            possible_repo_names = []
+            # 1. 標準 faster-whisper 格式
+            possible_repo_names.append(f"faster-whisper-{model_name}")
+            # 2. 針對 distil 系列的特殊格式
+            if model_name.startswith("distil-"):
+                distil_base_name = model_name.replace("distil-", "")
+                possible_repo_names.append(f"faster-distil-whisper-{distil_base_name}")
+            # 可以根據需要加入更多可能的格式
+
+            matching_dirs = []
+            found_repo_name = None
+            print(f"嘗試尋找以下可能的快取目錄模式 (在 {cache_dir} 下):")
+            for repo_candidate in possible_repo_names:
+                pattern = os.path.join(cache_dir, f"models--{owner}--{repo_candidate}")
+                print(f"  - 檢查模式: {pattern}")
+                current_matches = glob.glob(pattern)
+                if current_matches:
+                    matching_dirs.extend(current_matches)
+                    found_repo_name = repo_candidate # 儲存成功匹配的 repo name
+                    print(f"    找到匹配: {current_matches[0]}")
+                    break # 找到一個就停止，假設這是正確的
+
             if not matching_dirs:
-                 # 有些模型名稱可能不同，例如 distil 系列
-                 hf_repo_name_alt = f"distil-whisper-{model_name.replace('distil-','')}"
-                 cache_model_dir_pattern_alt = os.path.join(cache_dir, f"models--{owner}--{hf_repo_name_alt}")
-                 matching_dirs = glob.glob(cache_model_dir_pattern_alt)
-                 if not matching_dirs:
-                    print(f"錯誤: 找不到模型 '{model_name}' 的快取目錄，預期路徑模式: {cache_model_dir_pattern} 或 {cache_model_dir_pattern_alt}")
-                    continue # 處理下一個模型
-                 else:
-                    cache_model_dir = matching_dirs[0]
-                    hf_repo_name = hf_repo_name_alt # 更新 repo name 以便後續使用
+                print(f"錯誤: 找不到模型 '{model_name}' 的快取目錄。")
+                print("請檢查 download_root 目錄下的 'models--*' 子目錄，確認實際的快取目錄名稱。")
+                continue # 處理下一個模型
 
-            else:
-                 cache_model_dir = matching_dirs[0] # 通常只會有一個匹配
+            # 通常只會有一個匹配，取第一個
+            cache_model_dir = matching_dirs[0]
+            hf_repo_name = found_repo_name # 使用實際找到的 repo name
+            print(f"找到快取目錄: {cache_model_dir} (使用 repo name: {hf_repo_name})")
 
             snapshot_dir_pattern = os.path.join(cache_model_dir, "snapshots", "*")
             snapshot_dirs = glob.glob(snapshot_dir_pattern)
@@ -124,7 +148,7 @@ def main():
             print(f"找到 Snapshot 目錄: {snapshot_path}")
 
             # 3. 設定目標目錄並複製文件
-            # 目標目錄名稱直接使用 hf_repo_name，例如 faster-whisper-medium
+            # 目標目錄名稱使用實際找到的 hf_repo_name
             target_dir = os.path.join(args.download_root, hf_repo_name)
             print(f"步驟 3: 複製文件到目標目錄: {target_dir}")
 
@@ -140,13 +164,8 @@ def main():
 
                 try:
                     if os.path.isfile(source_item_path) or os.path.islink(source_item_path):
-                         # 重要：使用 shutil.copy2 複製實際文件（如果 source 是連結，會複製連結指向的文件）
-                         # 並且會保留文件的元數據（如修改時間）
                          shutil.copy2(source_item_path, target_item_path)
-                         # print(f"  複製: {item_name}")
                          copied_files.append(item_name)
-                    # else: # 忽略目錄或其他非文件類型
-                    #    print(f"  忽略: {item_name} (非文件或連結)")
                 except Exception as copy_e:
                     print(f"  複製文件 {item_name} 時出錯: {copy_e}")
                     failed_files.append(item_name)
@@ -169,12 +188,17 @@ def main():
 
 
         except Exception as e:
+            import traceback
             print(f"處理模型 '{model_name}' 時發生未預期的錯誤: {str(e)}")
+            # traceback.print_exc()
         finally:
-             # 確保釋放模型資源，即使過程中出錯
              if model is not None:
-                # print("釋放 WhisperModel 資源...")
-                del model # 釋放 GPU/CPU 資源
+                try:
+                    del model
+                except NameError:
+                    pass
+             cache_model_dir = None
+             hf_repo_name = None
 
 if __name__ == "__main__":
     main()

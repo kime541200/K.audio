@@ -21,6 +21,21 @@ logger = logging.getLogger(__name__)
 stt_model: WhisperModel | None = None
 
 
+# --- 可以在類別或函數開頭定義這些常數，方便調整 ---
+DEFAULT_TEMPERATURE = 0.0 # 或 (0.0, 0.2, 0.4)
+DEFAULT_NO_SPEECH_THRESHOLD = 0.7 # 提高此值以更嚴格判定語音 (預設 ~0.6)
+DEFAULT_LOG_PROB_THRESHOLD = -0.8 # 提高此值以過濾低概率結果 (預設 -1.0)
+FILTER_NO_SPEECH_PROB_THRESHOLD = 0.6 # 用於後處理過濾
+FILTER_AVG_LOGPROB_THRESHOLD = -1.0 # 用於後處理過濾 (可設為與上面 log_prob_threshold 一樣或稍寬鬆)
+# 常見幻覺詞列表 (可自行擴充)
+COMMON_HALLUCINATIONS = [
+    "Thank you for watching",
+    "Thanks for watching",
+    "Transcribed by",
+    "Please subscribe",
+    "...", # 避免單純的點點點
+]
+
 def load_stt_model():
     global stt_model # 聲明修改全局變數
     if stt_model is None:
@@ -145,66 +160,129 @@ class AudioTranscriptionStreamer:
         logger.info(f"AudioTranscriptionStreamer initialized. Silence threshold: {self.SILENCE_THRESHOLD_SEC}s ({self._silence_frames_needed} frames)")
 
     async def _transcribe_segment(self, audio_data: bytes) -> AsyncGenerator[Dict[str, Any], None]:
-        """在背景執行單個語音片段的轉錄"""
+        """
+        在背景執行單個語音片段的轉錄，並應用過濾減少幻覺。
+        """
         if not audio_data:
+            logger.info("Skipping transcription for empty audio data.")
             return
 
-        start_time = self._current_speech_start_time
+        start_time = self._current_speech_start_time # 假設 self._current_speech_start_time 在 process_audio_chunk 中被設置
         logger.info(f"Transcribing segment starting at {start_time:.2f}s...")
 
         try:
             # 將 bytes 轉換為 float32 numpy array (Whisper 需要這個格式)
             audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
+            # --- 設定轉錄選項 ---
+            # *** 修改點：移除所有不被接受的參數 ***
             transcribe_options = {
-                "language": self.language,
-                # "initial_prompt": self.initial_prompt,
-                # "word_timestamps": False, # 流式傳輸通常不需要詞級時間戳
-                # 在流式中，VAD 判斷已經在外部完成，這裡可以關閉內部 VAD filter
-                # "vad_filter": False,
+                # "language": self.language, # 語言提示通常是支持的
+                # "initial_prompt": self.initial_prompt, # 已移除
+                # "temperature": DEFAULT_TEMPERATURE, # <--- 移除
+                # "no_speech_threshold": DEFAULT_NO_SPEECH_THRESHOLD, # <--- 移除
+                # "log_prob_threshold": DEFAULT_LOG_PROB_THRESHOLD, # <--- 移除
+                # "word_timestamps": False, # 已移除
+                # "vad_filter": False,      # 已移除
             }
+            # 移除字典中值為 None 的項目 (現在主要影響 language)
             transcribe_options = {k: v for k, v in transcribe_options.items() if v is not None}
+
+            logger.info(f"Starting transcription for segment at {start_time:.2f}s with options: {transcribe_options}")
 
             # 使用 run_in_executor 在背景線程執行轉錄
             loop = asyncio.get_running_loop()
+            # 確保 self.stt_model 存在且已加載
+            if self.stt_model is None:
+                 logger.error("STT model is not loaded inside streamer.")
+                 raise ValueError("STT model not loaded")
+
             segments_generator, info = await loop.run_in_executor(
                 None, # 使用默認線程池
                 self.stt_model.transcribe, # 調用模型的 transcribe
-                audio_np, # 傳遞 numpy array
+                audio_np,                 # 傳遞 numpy array
                 **transcribe_options
             )
 
-            segment_text_parts = []
+            # --- 處理並過濾轉錄結果 ---
+            segment_text_parts: List[str] = []
             last_end_time = start_time # 初始化為片段開始時間
+            low_confidence_segments_skipped = 0
+            no_speech_segments_skipped = 0
+            hallucination_warnings = 0
+            total_segments_processed = 0
+
             for segment in segments_generator:
-                # Whisper 返回的時間戳是相對於 *當前片段* 的開始
-                # 我們需要加上片段的起始時間來得到絕對時間戳
+                total_segments_processed += 1
                 absolute_start = start_time + segment.start
                 absolute_end = start_time + segment.end
-                text = segment.text.strip()
-                segment_text_parts.append(text)
-                last_end_time = absolute_end # 更新最後結束時間
+                text = segment.text.strip() if segment.text else ""
 
-                # 產生最終結果 (目前我們只在片段結束時產生一個最終結果)
-                # 如果需要 partial results, 可以在這裡 yield
-                # logger.debug(f"Partial segment: [{absolute_start:.2f}s -> {absolute_end:.2f}s] {text}")
+                # 1. 過濾高 "無語音" 概率的片段
+                if segment.no_speech_prob > FILTER_NO_SPEECH_PROB_THRESHOLD:
+                    logger.info(f"Segment [{absolute_start:.2f}s -> {absolute_end:.2f}s] skipped (no_speech_prob: {segment.no_speech_prob:.2f} > {FILTER_NO_SPEECH_PROB_THRESHOLD}) Text: '{text}'")
+                    no_speech_segments_skipped += 1
+                    continue
 
+                # 2. 過濾低平均對數概率的片段 (可能為幻覺或低質量識別)
+                if segment.avg_logprob < FILTER_AVG_LOGPROB_THRESHOLD:
+                    logger.info(f"Segment [{absolute_start:.2f}s -> {absolute_end:.2f}s] skipped (avg_logprob: {segment.avg_logprob:.2f} < {FILTER_AVG_LOGPROB_THRESHOLD}) Text: '{text}'")
+                    low_confidence_segments_skipped += 1
+                    continue
+
+                # 3. 檢查是否包含常見幻覺詞 (僅發出警告，除非您想完全跳過)
+                contains_hallucination = False
+                for hallucination in COMMON_HALLUCINATIONS:
+                    # 進行不區分大小寫的檢查，並確保不是被包含在正常詞語中 (例如 "thanks" vs "Thanks for watching")
+                    # 這裡用簡單的 in 檢查，更複雜的匹配可能需要正則表達式
+                    if hallucination.lower() in text.lower():
+                        logger.warning(f"Segment [{absolute_start:.2f}s -> {absolute_end:.2f}s] potentially contains hallucination phrase '{hallucination}'. Text: '{text}'")
+                        hallucination_warnings += 1
+                        contains_hallucination = True
+                        # break # 如果找到一個就足夠發警告
+                # 如果決定要因為幻覺詞而跳過，可以在這裡加 continue
+                # if contains_hallucination:
+                #    continue
+
+                # --- 如果片段通過所有過濾 ---
+                if text: # 確保文本不為空
+                    segment_text_parts.append(text)
+                    last_end_time = absolute_end # 更新最後有效文本的結束時間
+                # logger.debug(f"Valid segment accepted: [{absolute_start:.2f}s -> {absolute_end:.2f}s] {text}")
+
+            # --- 組合最終文本並產生結果 ---
             full_text = " ".join(segment_text_parts)
+
+            # 僅在實際有文本輸出時才產生結果
             if full_text:
-                 logger.info(f"Segment transcription complete: [{start_time:.2f}s -> {last_end_time:.2f}s] {full_text}")
-                 yield {
+                confidence_score = None # faster-whisper 的 info 可能不直接提供整體置信度, 但可以基於過濾情況判斷
+                logger.info(f"Segment transcription complete: [{start_time:.2f}s -> {last_end_time:.2f}s] Text: '{full_text}' "
+                            f"(Processed: {total_segments_processed}, Skipped_NoSpeech: {no_speech_segments_skipped}, Skipped_LowConf: {low_confidence_segments_skipped}, HallucinationWarn: {hallucination_warnings})")
+                yield {
                     "type": "final",
                     "start": start_time,
-                    "end": last_end_time,
+                    "end": last_end_time, # 使用最後有效片段的結束時間
                     "text": full_text,
-                    "language": info.language # 也可以包含檢測到的語言
-                 }
+                    "language": info.language,
+                    "language_probability": info.language_probability,
+                    # 提供一些過濾的統計信息，供上層參考
+                    "confidence_info": {
+                         "total_segments_processed": total_segments_processed,
+                         "no_speech_segments_skipped": no_speech_segments_skipped,
+                         "low_confidence_segments_skipped": low_confidence_segments_skipped,
+                         "hallucination_warnings": hallucination_warnings,
+                         "avg_logprob_threshold": FILTER_AVG_LOGPROB_THRESHOLD,
+                         "no_speech_prob_threshold": FILTER_NO_SPEECH_PROB_THRESHOLD
+                    }
+                }
             else:
-                 logger.info(f"Segment transcription complete (no text output): [{start_time:.2f}s -> {last_end_time:.2f}s]")
-
+                logger.info(f"Segment transcription complete but no text output after filtering: [{start_time:.2f}s -> {last_end_time:.2f}s] "
+                            f"(Processed: {total_segments_processed}, Skipped_NoSpeech: {no_speech_segments_skipped}, Skipped_LowConf: {low_confidence_segments_skipped}, HallucinationWarn: {hallucination_warnings})")
+                # 可以選擇性地發送一個空的 final 消息或 info 消息
+                # yield {"type": "info", "message": "No speech detected or filtered out in segment"}
 
         except Exception as e:
-            logger.error(f"Error during segment transcription: {e}", exc_info=True)
+            logger.error(f"Error during segment transcription starting at {start_time:.2f}s: {e}", exc_info=True)
             yield {"type": "error", "message": f"Transcription error: {e}"}
 
     async def process_audio_chunk(self, chunk: bytes) -> AsyncGenerator[Dict[str, Any], None]:

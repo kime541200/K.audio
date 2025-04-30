@@ -4,6 +4,11 @@ import asyncio # 仍然需要導入 asyncio，但可能不再需要 loop
 import uvicorn
 from fastapi import FastAPI, Request # 為了 health check 導入 Request
 from fastapi.responses import JSONResponse # 為了 health check
+from fastapi.openapi.docs import (
+    get_redoc_html,
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+)
 
 # 導入設定
 from .core.config import settings
@@ -69,6 +74,36 @@ app = FastAPI(
 # --- 包含 API 路由 ---
 app.include_router(api_v1_audio.router)
 app.include_router(api_v1_summarize.router)
+
+
+####################
+# Swagger UI
+####################
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - Swagger UI",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_js_url=f"/static/swagger-ui-bundle.js",
+        swagger_css_url=f"/static/swagger-ui.css",
+    )
+
+
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+async def swagger_ui_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - ReDoc",
+        redoc_js_url="/static/redoc.standalone.js",
+    )
+
 
 # --- 根路徑 ---
 @app.get("/")

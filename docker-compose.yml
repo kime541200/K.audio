@@ -3,6 +3,7 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile
+    image: k-audio
     container_name: k_audio_server_container
     ports:
       - "8000:8000"
@@ -11,7 +12,7 @@ services:
       - ./server/app:/app/app
       # 掛載本地 models 目錄到容器的 /app/models 目錄
       # 這樣容器就能讀取本地下載的模型檔案了
-      - ./models:/app/models
+      - /data/models/hf/stt:/app/models
     deploy:
       resources:
         reservations:
@@ -23,14 +24,15 @@ services:
               count: all
               # 必須包含 gpu (將註解移到這裡)
               capabilities: [gpu]
+              # device_ids: ["5"]
     environment:
       # --- STT Settings (保持不變或按需修改) ---
       - STT_DEVICE=${STT_DEVICE:-cuda}
       - STT_COMPUTE_TYPE=${STT_COMPUTE_TYPE:-float16}
       - STT_MODEL_PATH=${STT_MODEL_PATH:-/app/models/faster-whisper-medium}
       - TZ=Asia/Taipei
-      # --- LLM Settings (在這裡設置您需要的值) ---
-      - LOCAL_LLM_API_BASE=http://192.168.1.103:8001/v1 # <--- 在這裡設置 LLM URL
-      - LOCAL_LLM_MODEL_NAME=cogito-v1-preview-llama-3B-Q8_0 # <--- 在這裡設置模型名稱
+      # --- LLM Settings (在這裡設置需要的值) ---
+      - LOCAL_LLM_API_BASE=http://192.168.1.103:1000/v1 # <--- 在這裡設置 LLM URL
+      - LOCAL_LLM_MODEL_NAME=Qwen3-30B-A3B-UD-Q4_K_XL # <--- 在這裡設置模型名稱
       - LOCAL_LLM_API_KEY=${LOCAL_LLM_API_KEY:-DUMMY_KEY} # 可以保持預設或允許外部環境變數覆蓋
     restart: unless-stopped
