@@ -18,6 +18,15 @@ class Settings(BaseSettings):
     # 可以添加 LLM 模型名稱的配置，如果需要的話
     local_llm_model_name: str = Field(default="local-llm", validation_alias="LOCAL_LLM_MODEL_NAME") # 本地 LLM 使用的模型名稱 (或留空讓端點決定)
 
+    # --- 新增：TTS 服務地址配置 ---
+    tts_service_api_base: str = Field(
+        default="http://localhost:8880", # 默認指向本地 8880
+        validation_alias="TTS_SERVICE_API_BASE",
+        description="URL of the separate TTS service (e.g., Kokoro-FastAPI)"
+    )
+    # 可以選擇性添加 TTS 服務需要的 API Key (如果有的話)
+    # tts_service_api_key: str | None = Field(default=None, validation_alias="TTS_SERVICE_API_KEY")
+
 
     class Config:
         # If you want to load variables from a .env file:

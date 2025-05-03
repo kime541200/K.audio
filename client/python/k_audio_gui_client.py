@@ -1,5 +1,6 @@
 import tkinter
 from tkinter import filedialog, messagebox
+from tkinter import ttk # <--- 導入 ttk 用於 PanedWindow
 import customtkinter as ctk
 import sounddevice as sd
 import asyncio
@@ -13,6 +14,9 @@ from datetime import datetime
 import logging
 import platform
 import ctypes
+import numpy as np
+import wave
+import io
 
 # --- 基本設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -40,61 +44,55 @@ class KAudioClientApp(ctk.CTk):
         super().__init__()
 
         self.title("K.audio Client")
-        self.geometry("900x700") # 稍微再增大
+        self.geometry("900x750")
 
         # --- 字體定義 ---
-        # *** 修改點：定義字體 ***
-        # 可以根據操作系統選擇不同字體
         system_name = platform.system()
         if system_name == "Windows":
             default_font_family = "Segoe UI"
-            cjk_font_family = "Microsoft JhengHei UI" # 或 Microsoft YaHei UI
-        elif system_name == "Darwin": # macOS
+            cjk_font_family = "Microsoft JhengHei UI"
+        elif system_name == "Darwin":
             default_font_family = "Helvetica Neue"
-            cjk_font_family = "PingFang TC" # 或 PingFang SC
+            cjk_font_family = "PingFang TC"
         else: # Linux or other
-            default_font_family = "Ubuntu" # 或 Noto Sans, sans-serif
-            cjk_font_family = "Noto Sans CJK TC" # 需要用戶安裝
-        
-        # 創建字體對象 (可選，也可以直接用元組)
+            default_font_family = "Ubuntu"
+            cjk_font_family = "Noto Sans CJK TC"
+
         self.label_font = ctk.CTkFont(family=default_font_family, size=13)
         self.button_font = ctk.CTkFont(family=default_font_family, size=13, weight="bold")
-        self.entry_font = ctk.CTkFont(family=cjk_font_family, size=13) # CJK 字體用於可能輸入中文的地方
-        self.textbox_font = ctk.CTkFont(family=cjk_font_family, size=14) # 文本框用稍大字體
-
-
+        self.entry_font = ctk.CTkFont(family=cjk_font_family, size=13)
+        self.textbox_font = ctk.CTkFont(family=cjk_font_family, size=14)
 
         # --- 狀態變數 ---
         self.is_recording = False
         self.async_thread = None
         self.websocket_client = None
         self.audio_stream = None
-        # *** 修改點：移除在這裡創建 asyncio 對象 ***
-        # self.stop_event = asyncio.Event()
-        # self.audio_queue = asyncio.Queue()
-        self.stop_event = None # 初始化為 None
-        self.audio_queue = None # 初始化為 None
-        self.gui_queue = queue.Queue() # GUI 隊列保持不變
+        self.stop_event = None
+        self.audio_queue = None
+        self.gui_queue = queue.Queue()
         self.transcript_parts = []
         self.session_timestamp = None
         self.session_dir = None
         self.output_dir_var = ctk.StringVar(value="./k.audio_output")
+        self.available_voices_list = []
+        self.tts_voice_var = ctk.StringVar(value="Loading...")
+        self.voice_checkbox_vars = {}
+        self.conversation_mode_var = ctk.BooleanVar() # <--- 初始化對話模式變量
+        self.right_pane_label_var = ctk.StringVar(value="Translation") # <--- 初始化右側窗格標籤變量
 
         # --- UI 佈局 ---
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1) # PanedWindow 在第 3 行
 
         # --- 頂部菜單欄 ---
         self.menu_frame = ctk.CTkFrame(self, height=30)
         self.menu_frame.grid(row=0, column=0, padx=10, pady=(10,0), sticky="ew")
-
-        self.theme_label = ctk.CTkLabel(self.menu_frame, text="Appearance:", font=self.label_font) # <--- 應用字體
+        self.theme_label = ctk.CTkLabel(self.menu_frame, text="Appearance:", font=self.label_font)
         self.theme_label.pack(side="left", padx=(10, 5))
         self.theme_menu = ctk.CTkOptionMenu(
-            self.menu_frame,
-            values=["System", "Light", "Dark"],
-            command=self.change_appearance_mode,
-            font=self.label_font # <--- 應用字體
+            self.menu_frame, values=["System", "Light", "Dark"],
+            command=self.change_appearance_mode, font=self.label_font
         )
         self.theme_menu.pack(side="left", padx=5)
 
@@ -103,86 +101,129 @@ class KAudioClientApp(ctk.CTk):
         self.settings_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
         self.settings_frame.grid_columnconfigure(1, weight=1)
         self.settings_frame.grid_columnconfigure(3, weight=1)
-        # 列 0, 2, 4, 5 保持 weight=0
 
         # Row 0: URL
-        self.url_label = ctk.CTkLabel(self.settings_frame, text="Server URL:")
+        self.url_label = ctk.CTkLabel(self.settings_frame, text="Server URL:", font=self.label_font)
         self.url_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.url_entry = ctk.CTkEntry(self.settings_frame, placeholder_text="ws://<server_ip>:8000/v1/audio/transcriptions/ws")
-        self.url_entry.grid(row=0, column=1, columnspan=4, padx=5, pady=5, sticky="ew") # 橫跨到第4列
-        # *** 請修改為您的伺服器默認地址 ***
-        self.url_entry.insert(0, "ws://localhost:8000/v1/audio/transcriptions/ws")
+        self.url_entry = ctk.CTkEntry(self.settings_frame, placeholder_text="ws://<server_ip>:8000/v1/audio/transcriptions/ws", font=self.entry_font)
+        self.url_entry.grid(row=0, column=1, columnspan=4, padx=5, pady=5, sticky="ew")
+        self.url_entry.insert(0, "ws://localhost:8000/v1/audio/transcriptions/ws") # 使用 localhost 作為更通用的默認值
 
         # Row 1: Device & Output Directory
-        self.device_label = ctk.CTkLabel(self.settings_frame, text="Input Device:")
+        self.device_label = ctk.CTkLabel(self.settings_frame, text="Input Device:", font=self.label_font)
         self.device_label.grid(row=1, column=0, padx=5, pady=5, sticky="w")
         self.device_options = self.get_input_devices()
         self.device_var = ctk.StringVar(value=self.get_default_input_device_name())
-        self.device_menu = ctk.CTkOptionMenu(self.settings_frame, variable=self.device_var, values=list(self.device_options.keys()))
+        self.device_menu = ctk.CTkOptionMenu(self.settings_frame, variable=self.device_var, values=list(self.device_options.keys()), font=self.label_font)
         self.device_menu.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-
-        self.output_dir_label = ctk.CTkLabel(self.settings_frame, text="Output Dir:")
+        self.output_dir_label = ctk.CTkLabel(self.settings_frame, text="Output Dir:", font=self.label_font)
         self.output_dir_label.grid(row=1, column=2, padx=(10,5), pady=5, sticky="w")
-        # 使用 textvariable 綁定 StringVar
-        self.output_dir_entry = ctk.CTkEntry(self.settings_frame, textvariable=self.output_dir_var)
+        self.output_dir_entry = ctk.CTkEntry(self.settings_frame, textvariable=self.output_dir_var, font=self.entry_font)
         self.output_dir_entry.grid(row=1, column=3, padx=5, pady=5, sticky="ew")
-        self.browse_button = ctk.CTkButton(self.settings_frame, text="Browse...", command=self.browse_output_directory, width=80)
+        self.browse_button = ctk.CTkButton(self.settings_frame, text="Browse...", command=self.browse_output_directory, width=80, font=self.button_font)
         self.browse_button.grid(row=1, column=4, padx=5, pady=5)
 
         # Row 2: Translation Options
         self.translate_var = ctk.BooleanVar()
-        self.translate_checkbox = ctk.CTkCheckBox(self.settings_frame, text="Translate", variable=self.translate_var, command=self.toggle_translation_options)
+        self.translate_checkbox = ctk.CTkCheckBox(self.settings_frame, text="Translate", variable=self.translate_var, command=self.toggle_translation_options, font=self.label_font)
         self.translate_checkbox.grid(row=2, column=0, padx=5, pady=5, sticky="w")
-
-        self.target_lang_label = ctk.CTkLabel(self.settings_frame, text="Target:")
+        self.target_lang_label = ctk.CTkLabel(self.settings_frame, text="Target:", font=self.label_font)
         self.target_lang_label.grid(row=2, column=1, padx=(5, 5), pady=5, sticky="e")
-        self.target_lang_entry = ctk.CTkEntry(self.settings_frame, placeholder_text="en", width=60)
+        self.target_lang_entry = ctk.CTkEntry(self.settings_frame, placeholder_text="en", width=60, font=self.entry_font)
         self.target_lang_entry.grid(row=2, column=2, padx=5, pady=5, sticky="w")
-
-        self.source_lang_label = ctk.CTkLabel(self.settings_frame, text="Source (Opt):")
+        self.source_lang_label = ctk.CTkLabel(self.settings_frame, text="Source (Opt):", font=self.label_font)
         self.source_lang_label.grid(row=2, column=3, padx=(5, 5), pady=5, sticky="e")
-        self.source_lang_entry = ctk.CTkEntry(self.settings_frame, placeholder_text="zh", width=60)
+        self.source_lang_entry = ctk.CTkEntry(self.settings_frame, placeholder_text="zh", width=60, font=self.entry_font)
         self.source_lang_entry.grid(row=2, column=4, padx=5, pady=5, sticky="w")
-        self.toggle_translation_options()
+
+        # Row 3: Conversation Mode
+        self.conversation_checkbox = ctk.CTkCheckBox(
+            self.settings_frame, text="Conversation Mode", variable=self.conversation_mode_var,
+            font=self.label_font, command=self.toggle_conversation_mode
+        )
+        self.conversation_checkbox.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="w")
 
         # Control Buttons (Column 5)
-        self.start_button = ctk.CTkButton(self.settings_frame, text="Start Recording", command=self.start_recording)
+        self.start_button = ctk.CTkButton(self.settings_frame, text="Start Recording", command=self.start_recording, font=self.button_font)
         self.start_button.grid(row=0, column=5, padx=10, pady=5, sticky="ew")
-        self.stop_button = ctk.CTkButton(self.settings_frame, text="Stop Recording", command=self.stop_recording, state="disabled")
+        self.stop_button = ctk.CTkButton(self.settings_frame, text="Stop Recording", command=self.stop_recording, state="disabled", font=self.button_font)
         self.stop_button.grid(row=1, column=5, padx=10, pady=5, sticky="ew")
-        self.summarize_button = ctk.CTkButton(self.settings_frame, text="Summarize", command=self.summarize_transcript, state="disabled")
+        self.summarize_button = ctk.CTkButton(self.settings_frame, text="Summarize", command=self.summarize_transcript, state="disabled", font=self.button_font)
         self.summarize_button.grid(row=2, column=5, padx=10, pady=5, sticky="ew")
+        self.transcribe_file_button = ctk.CTkButton(self.settings_frame, text="Transcribe File...", command=self.transcribe_file_button_clicked, font=self.button_font)
+        self.transcribe_file_button.grid(row=0, column=6, padx=(5, 10), pady=5, sticky="ew")
+        # --- TTS 控制框架 ---
+        self.tts_frame = ctk.CTkFrame(self)
+        self.tts_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
+        self.tts_frame.grid_columnconfigure(1, weight=1)
+        self.tts_label = ctk.CTkLabel(self.tts_frame, text="Text to Speech:", font=self.label_font)
+        self.tts_label.grid(row=0, column=0, padx=5, pady=(10, 0), sticky="nw")
+        self.tts_input_textbox = ctk.CTkTextbox(self.tts_frame, height=80, wrap="word", font=self.textbox_font)
+        self.tts_input_textbox.grid(row=0, column=1, padx=5, pady=(10, 5), sticky="ew")
+        self.tts_input_textbox.insert("1.0", "Hello world! This is a test.")
+        self.tts_input_textbox.configure(state="disabled")
+        self.tts_options_frame = ctk.CTkFrame(self.tts_frame)
+        self.tts_options_frame.grid(row=1, column=1, padx=5, pady=(0, 10), sticky="ew")
+        self.tts_voice_label = ctk.CTkLabel(self.tts_options_frame, text="Voice(s):", font=self.label_font)
+        self.tts_voice_label.pack(side="left", padx=(0, 5))
+        self.selected_voice_display = ctk.CTkLabel( # *** 修正：移除重複的定義 ***
+            self.tts_options_frame, textvariable=self.tts_voice_var, font=self.label_font, anchor="w"
+        )
+        self.selected_voice_display.pack(side="left", padx=5, fill="x", expand=True)
+        self.select_voice_button = ctk.CTkButton(
+            self.tts_options_frame, text="Select Voice(s)...", command=self.open_voice_selection_popup,
+            font=self.button_font, width=120
+        )
+        self.select_voice_button.pack(side="left", padx=5)
+        self.select_voice_button.configure(state="disabled")
+        self.retry_load_voices_button = ctk.CTkButton(self.tts_options_frame, text="Retry Load", command=self.init_load_voices, font=self.button_font, width=80)
+        self.retry_load_voices_button.pack(side="left", padx=(5,0))
+        self.retry_load_voices_button.pack_forget()
+        self.speak_button = ctk.CTkButton(self.tts_options_frame, text="Speak", command=self.synthesize_and_play, font=self.button_font)
+        self.speak_button.pack(side="left", padx=10)
+        self.speak_button.configure(state="disabled")
 
-        # *** 新增：文件轉錄按鈕 ***
-        self.transcribe_file_button = ctk.CTkButton(self.settings_frame, text="Transcribe File...", command=self.transcribe_file_button_clicked, font=self.button_font) # <-- Font
-        self.transcribe_file_button.grid(row=0, column=6, padx=(5, 10), pady=5, sticky="ew") # 放在第 6 列
+        # --- 使用 PanedWindow 替代 display_frame ---
+        self.paned_window = ttk.PanedWindow(self, orient=tkinter.HORIZONTAL)
+        self.paned_window.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        self.transcript_pane_frame = ctk.CTkFrame(self.paned_window, corner_radius=0)
+        self.translation_pane_frame = ctk.CTkFrame(self.paned_window, corner_radius=0)
+        self.paned_window.add(self.transcript_pane_frame, weight=1)
+        self.paned_window.add(self.translation_pane_frame, weight=1)
 
+        # --- 在左右框架內添加標籤和文本框 ---
+        self.transcript_pane_frame.grid_rowconfigure(1, weight=1)
+        self.transcript_pane_frame.grid_columnconfigure(0, weight=1)
+        self.transcript_label = ctk.CTkLabel(self.transcript_pane_frame, text="Transcript", font=self.label_font)
+        self.transcript_label.grid(row=0, column=0, padx=5, pady=(5,0), sticky="w")
+        self.transcript_textbox = ctk.CTkTextbox(self.transcript_pane_frame, wrap="word", state="disabled", font=self.textbox_font)
+        self.transcript_textbox.grid(row=1, column=0, padx=5, pady=(0,5), sticky="nsew")
 
-        # --- 文本顯示框架 ---
-        self.display_frame = ctk.CTkFrame(self)
-        self.display_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="nsew")
-        self.display_frame.grid_columnconfigure(0, weight=1)
-        self.display_frame.grid_columnconfigure(1, weight=1)
-        self.display_frame.grid_rowconfigure(0, weight=1)
-
-        # 文字稿文本框
-        self.transcript_textbox = ctk.CTkTextbox(self.display_frame, wrap="word", state="disabled", font=self.textbox_font) # <-- Font
-        self.transcript_textbox.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="nsew")
-
-        # 翻譯文本框
-        self.translation_textbox = ctk.CTkTextbox(self.display_frame, wrap="word", state="disabled", font=self.textbox_font) # <-- Font
-        self.translation_textbox.grid(row=0, column=1, padx=(5, 10), pady=10, sticky="nsew")
+        # --- 翻譯窗格的佈局和標籤 ---
+        self.translation_pane_frame.grid_rowconfigure(1, weight=1)
+        self.translation_pane_frame.grid_columnconfigure(0, weight=1)
+        # self.translation_label = ctk.CTkLabel(self.translation_pane_frame, text="Translation", font=self.label_font) # 舊標籤
+        # 使用 StringVar 控制標籤文本
+        self.right_pane_label = ctk.CTkLabel(self.translation_pane_frame, textvariable=self.right_pane_label_var, font=self.label_font)
+        self.right_pane_label.grid(row=0, column=0, padx=5, pady=(5,0), sticky="w")
+        self.translation_textbox = ctk.CTkTextbox(self.translation_pane_frame, wrap="word", state="disabled", font=self.textbox_font)
+        self.translation_textbox.grid(row=1, column=0, padx=5, pady=(0,5), sticky="nsew")
 
         # --- 狀態欄 ---
-        self.status_label = ctk.CTkLabel(self, text="Status: Idle", anchor="w", height=20, font=self.label_font) # <-- Font
-        self.status_label.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+        self.status_label = ctk.CTkLabel(self, text="Status: Idle", anchor="w", height=20, font=self.label_font)
+        self.status_label.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
 
-        # --- 配置 Textbox Tag 樣式 (保持不變) ---
+        # --- Tag 配置 ---
         self.transcript_textbox.tag_config("error", foreground="red")
         self.translation_textbox.tag_config("error", foreground="red")
 
-        # --- 啟動 GUI 隊列處理 ---
+        # Initial state based on checkboxes
+        self.toggle_translation_options()
+        self.toggle_conversation_mode()
+
+        # --- 啟動 GUI 隊列處理 & 加載聲音 ---
         self.process_gui_queue()
+        self.after(100, self.init_load_voices)
 
     # --- UI 輔助方法 ---
     def get_input_devices(self):
@@ -205,35 +246,228 @@ class KAudioClientApp(ctk.CTk):
             options = list(self.get_input_devices().keys())
             return options[0] if options else ""
 
-    def toggle_translation_options(self):
-        if self.translate_var.get():
-            self.target_lang_entry.configure(state="normal")
-            self.source_lang_entry.configure(state="normal")
-            # *** 新增：設置默認目標語言 ***
-            if not self.target_lang_entry.get(): # 檢查是否為空
-                self.target_lang_entry.insert(0, "en") # 插入 "en"
-        else:
-            self.target_lang_entry.configure(state="disabled")
-            self.source_lang_entry.configure(state="disabled")
-
-    def update_status(self, message):
-        self.status_label.configure(text=f"Status: {message}")
-
     def browse_output_directory(self):
         dir_path = filedialog.askdirectory(initialdir=self.output_dir_var.get() or Path(".").resolve())
         if dir_path:
             self.output_dir_var.set(dir_path) # <--- 更新 StringVar
             logger.info(f"Output directory set to: {dir_path}")
 
-
-    # *** 新增：實現 change_appearance_mode 方法 ***
+    # --- 實現 change_appearance_mode 方法 ---
     def change_appearance_mode(self, new_mode: str):
         """更改 CustomTkinter 的外觀模式"""
         new_mode_lower = new_mode.lower() # 確保是小寫
         ctk.set_appearance_mode(new_mode_lower)
         logger.info(f"Appearance mode changed to: {new_mode_lower}")
 
-    # --- GUI 消息處理 (添加文件轉錄結果處理) ---
+    def toggle_translation_options(self):
+        # *** 修改：檢查對話模式狀態 ***
+        # 只有在非對話模式下，翻譯選項才可能啟用
+        can_enable_translate = not self.conversation_mode_var.get()
+        translate_checked = self.translate_var.get()
+
+        if translate_checked and can_enable_translate:
+            self.target_lang_entry.configure(state="normal")
+            self.source_lang_entry.configure(state="normal")
+            if not self.target_lang_entry.get():
+                self.target_lang_entry.insert(0, "en")
+        else:
+            # 如果對話模式啟用或翻譯未勾選，都禁用
+            self.target_lang_entry.configure(state="disabled")
+            self.source_lang_entry.configure(state="disabled")
+    
+    # --- 切換對話模式的 UI 邏輯 ---
+    def toggle_conversation_mode(self):
+        if self.conversation_mode_var.get():
+            # 進入對話模式
+            self.right_pane_label_var.set("LLM Response") # 更新標籤
+            # 禁用翻譯相關（如果之前未禁用）
+            self.translate_checkbox.configure(state="disabled")
+            self.translate_var.set(False) # 取消勾選
+            self.toggle_translation_options() # 確保語言輸入框被禁用
+            # 禁用其他按鈕
+            self.summarize_button.configure(state="disabled")
+            self.transcribe_file_button.configure(state="disabled")
+        else:
+            # 退出對話模式
+            self.right_pane_label_var.set("Translation") # 恢復標籤
+            # 啟用翻譯相關
+            self.translate_checkbox.configure(state="normal")
+            self.toggle_translation_options() # 根據翻譯勾選框恢復
+            # 恢復其他按鈕狀態
+            self.transcribe_file_button.configure(state="normal")
+            if self.transcript_parts and not self.is_recording: # 只有在有記錄且未錄音時才啟用總結
+                self.summarize_button.configure(state="normal")
+            else:
+                self.summarize_button.configure(state="disabled")
+
+    def update_status(self, message):
+        self.status_label.configure(text=f"Status: {message}")
+
+    # --- 加載聲音列表的方法 ---
+    def load_voices_from_server(self):
+        """從 K.audio 伺服器獲取聲音列表並更新變數和 UI"""
+        logger.info("Attempting to load voices from server...")
+        self.tts_voice_var.set("Loading...")
+        if hasattr(self, 'select_voice_button'): self.select_voice_button.configure(state="disabled")
+        if hasattr(self, 'speak_button'): self.speak_button.configure(state="disabled")
+        if hasattr(self, 'tts_input_textbox'): self.tts_input_textbox.configure(state="disabled")
+        if hasattr(self, 'retry_load_voices_button'): self.retry_load_voices_button.pack_forget()
+
+        ws_url = self.url_entry.get().strip()
+        if not ws_url.startswith("ws://"):
+            logger.error("Cannot load voices: Invalid WebSocket URL.")
+            self.update_status("Error: Cannot load voices - Invalid URL")
+            self.tts_voice_var.set("Error loading")
+            if hasattr(self, 'retry_load_voices_button'): self.retry_load_voices_button.pack(side="left", padx=(5,0))
+            if hasattr(self, 'select_voice_button'): self.select_voice_button.configure(state="disabled")
+            return
+
+        base_url = ws_url.split('/v1/audio/transcriptions/ws')[0]
+        server_http_url = base_url.replace("ws://", "http://", 1)
+        voices_url = f"{server_http_url}/v1/audio/voices"
+
+        try:
+            with httpx.Client() as client:
+                response = client.get(voices_url, timeout=10.0)
+                response.raise_for_status()
+                data = response.json()
+
+            if "voices" in data and isinstance(data["voices"], list) and data["voices"]:
+                self.available_voices_list = sorted(data["voices"])
+                logger.info(f"Successfully loaded {len(self.available_voices_list)} voices.")
+                default_voice = self.available_voices_list[0]
+                self.tts_voice_var.set(default_voice)
+                if hasattr(self, 'select_voice_button'): self.select_voice_button.configure(state="normal")
+                if hasattr(self, 'speak_button'): self.speak_button.configure(state="normal")
+                if hasattr(self, 'tts_input_textbox'): self.tts_input_textbox.configure(state="normal")
+                if hasattr(self, 'retry_load_voices_button'): self.retry_load_voices_button.pack_forget()
+                self.update_status("Voices loaded.")
+            else:
+                logger.error(f"Failed to load voices: Invalid format received - {data}")
+                self.available_voices_list = []
+                self.tts_voice_var.set("Load failed")
+                if hasattr(self, 'retry_load_voices_button'): self.retry_load_voices_button.pack(side="left", padx=(5,0))
+                self.update_status("Error: Failed to load voices - Invalid format")
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error loading voices: {e.response.status_code} - {e.response.text[:100]}")
+            self.available_voices_list = []
+            self.tts_voice_var.set("Load failed")
+            if hasattr(self, 'retry_load_voices_button'): self.retry_load_voices_button.pack(side="left", padx=(5,0))
+            self.update_status(f"Error: Failed to load voices - Server error {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"Error loading voices: {e}", exc_info=True)
+            self.available_voices_list = []
+            self.tts_voice_var.set("Load failed")
+            if hasattr(self, 'retry_load_voices_button'): self.retry_load_voices_button.pack(side="left", padx=(5,0))
+            self.update_status(f"Error: Failed to load voices - {e}")
+
+    def init_load_voices(self):
+        # *** 修改點：在開始加載前禁用重試按鈕 ***
+        # 需要檢查按鈕是否存在，因為 after 可能在按鈕創建前被調用
+        if hasattr(self, 'retry_load_voices_button'):
+            self.retry_load_voices_button.pack_forget()
+        threading.Thread(target=self.load_voices_from_server, daemon=True).start()
+
+    def open_voice_selection_popup(self):
+        if not self.available_voices_list:
+            logger.warning("Voice list not loaded yet or empty.")
+            messagebox.showwarning("No Voices", "Voice list is not available.")
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("Select Voice(s)")
+        popup.geometry("350x450")
+        popup.transient(self)
+        # popup.grab_set() # 先註釋掉 grab_set 看看是否影響滾輪
+        
+        scrollable_frame = ctk.CTkScrollableFrame(popup, label_text="Available Voices", label_font=self.label_font)
+        scrollable_frame.pack(padx=10, pady=10, expand=True, fill="both")
+
+        # --- 添加滾輪綁定 ---
+        def _on_mousewheel(event):
+            # 根據事件 delta 或 num 計算滾動量
+            # CustomTkinter 的滾動框架內部應該處理了這個，但我們再綁定一次以確保
+            # 注意：這個 delta 值在不同平台可能不同或符號相反
+            # 這裡用 CustomTkinter 的內部方法嘗試滾動 (可能需要根據版本調整)
+            # 或者直接操作 canvas yview_scroll
+            if platform.system() == "Linux":
+                scroll_amount = -1 if event.num == 4 else 1
+            elif platform.system() == "Darwin": # macOS
+                scroll_amount = -1 * event.delta
+            else: # Windows
+                scroll_amount = -1 * int(event.delta / 120)
+
+            # 嘗試調用內部滾動方法 (如果存在)
+            if hasattr(scrollable_frame, "_parent_canvas"): # 檢查內部 canvas 是否存在
+                scrollable_frame._parent_canvas.yview_scroll(scroll_amount, "units")
+            else: # 備用方法 (可能不適用於 CTkScrollableFrame 的內部結構)
+                pass # logger.warning("Could not find internal canvas for scrolling")
+
+        # 綁定到 scrollable_frame 和可能需要獲取焦點的子組件
+        # 綁定到框架本身
+        scrollable_frame.bind("<MouseWheel>", _on_mousewheel)
+        # 當鼠標進入時嘗試獲取焦點 (有助於滾輪事件)
+        scrollable_frame.bind("<Enter>", lambda e: scrollable_frame.focus_set())
+
+        # --- 修改點：創建 CheckBox ---
+        for voice_name in self.available_voices_list:
+            var = ctk.BooleanVar()            
+            if voice_name.split('(')[0].strip() in set(s.split('(')[0].strip() for s in self.tts_voice_var.get().split('+')):
+                var.set(True)
+            self.voice_checkbox_vars[voice_name] = var
+
+            cb = ctk.CTkCheckBox(
+                scrollable_frame, text=voice_name, variable=var, font=self.label_font
+            )
+            cb.pack(anchor="w", padx=10, pady=2)
+            # *** 新增：也為 CheckBox 綁定滾輪事件 ***
+            # 這確保了當鼠標懸停在選項上時也能滾動
+            cb.bind("<MouseWheel>", _on_mousewheel)
+
+        # --- 修改點：OK 按鈕的命令 ---
+        ok_button = ctk.CTkButton(
+            popup,
+            text="OK",
+            # 使用 lambda 傳遞 popup 對象給回調函數
+            command=lambda p=popup: self.apply_voice_selection_and_close(p),
+            font=self.button_font
+        )
+        ok_button.pack(pady=10)
+
+        # *** 修改點：延遲執行 grab_set ***
+        # popup.grab_set() # 直接調用可能太快
+        popup.after(100, popup.grab_set) # 延遲 100ms 執行 grab_set
+
+    # --- 應用聲音選擇並關閉彈窗的方法 ---
+    def apply_voice_selection_and_close(self, popup_window):
+        """收集選中的聲音，更新變量，並關閉彈窗"""
+        selected_voices = []
+        for voice_name, var in self.voice_checkbox_vars.items():
+            if var.get(): # 如果被選中
+                selected_voices.append(voice_name)
+
+        if not selected_voices:
+            # 如果一個都沒選，可以彈出提示或設置一個默認值
+            # messagebox.showwarning("No Selection", "Please select at least one voice.", parent=popup_window)
+            # return
+            # 或者設置為第一個可用的聲音
+            if self.available_voices_list:
+                 selected_voices.append(self.available_voices_list[0])
+                 logger.warning("No voice selected, defaulting to the first available voice.")
+            else: # 理論上不可能發生，因為按鈕是禁用的
+                 logger.error("No voices available to select.")
+                 popup_window.destroy()
+                 return
+
+
+        # 使用 '+' 連接選中的聲音名稱
+        combined_voice_string = "+".join(selected_voices)
+        self.tts_voice_var.set(combined_voice_string) # 更新主界面的 StringVar
+        logger.info(f"Voice selection updated: {combined_voice_string}")
+        popup_window.destroy() # 關閉彈窗
+
+    # --- GUI 消息處理 ---
     def process_gui_queue(self):
         try:
             while True:
@@ -242,42 +476,78 @@ class KAudioClientApp(ctk.CTk):
                 logger.debug(f"Processing GUI queue message: {message}")
 
                 if msg_type == "summary_result":
-                     logger.info("Processing summary_result message.") # <-- 添加日誌
-                     summary = message.get("summary", "No summary content.")
-                     self.show_summary_popup(summary) # <-- 調用彈窗
-                     self.update_status("Summary received.")
-                     # 重新啟用按鈕，確保即使彈窗有問題按鈕也能恢復
-                     if not self.is_recording and self.transcript_parts:
-                         self.summarize_button.configure(state="normal")
+                    logger.info("Processing summary_result message.") # <-- 添加日誌
+                    summary = message.get("summary", "No summary content.")
+                    self.show_summary_popup(summary) # <-- 調用彈窗
+                    self.update_status("Summary received.")
+                    # 重新啟用按鈕，確保即使彈窗有問題按鈕也能恢復
+                    if not self.is_recording and self.transcript_parts:
+                        self.summarize_button.configure(state="normal")
 
                 elif msg_type == "enable_summary_button":
-                     # 重新啟用按鈕的邏輯
-                     if not self.is_recording and self.transcript_parts:
-                         self.summarize_button.configure(state="normal")
-                         logger.debug("Summarize button re-enabled via queue.")
-                     else:
-                          logger.debug("Conditions not met to re-enable summarize button via queue.")
+                    # 重新啟用按鈕的邏輯
+                    if not self.is_recording and self.transcript_parts:
+                        self.summarize_button.configure(state="normal")
+                        logger.debug("Summarize button re-enabled via queue.")
+                    else:
+                        logger.debug("Conditions not met to re-enable summarize button via queue.")
 
                 elif msg_type == "force_stop_ui":
-                     if self.is_recording:
-                          self.stop_recording()
-                     self.update_status("Stopped due to error in background task.")
+                    if self.is_recording:
+                        self.stop_recording()
+                    self.update_status("Stopped due to error in background task.")
 
-                # *** 新增：處理文件轉錄結果 ***
+                # --- 處理文件轉錄結果 ---
                 elif msg_type == "file_transcription_result":
-                     result_text = message.get("text", "No text found.")
-                     file_path = message.get("file_path", "Unknown file")
-                     self.show_file_transcription_popup(f"Result for: {Path(file_path).name}", result_text)
-                     self.update_status(f"File transcription complete: {Path(file_path).name}")
-                     self.transcribe_file_button.configure(state="normal") # 重新啟用按鈕
+                    result_text = message.get("text", "No text found.")
+                    file_path = message.get("file_path", "Unknown file")
+                    self.show_file_transcription_popup(f"Result for: {Path(file_path).name}", result_text)
+                    self.update_status(f"File transcription complete: {Path(file_path).name}")
+                    self.transcribe_file_button.configure(state="normal") # 重新啟用按鈕
+                
                 elif msg_type == "file_transcription_error":
-                     error_msg = message.get("error", "Unknown error")
-                     file_path = message.get("file_path", "Unknown file")
-                     messagebox.showerror("File Transcription Error", f"Failed to transcribe {Path(file_path).name}:\n{error_msg}")
-                     self.update_status(f"Error transcribing file: {error_msg}")
-                     self.transcribe_file_button.configure(state="normal") # 重新啟用按鈕
+                    error_msg = message.get("error", "Unknown error")
+                    file_path = message.get("file_path", "Unknown file")
+                    messagebox.showerror("File Transcription Error", f"Failed to transcribe {Path(file_path).name}:\n{error_msg}")
+                    self.update_status(f"Error transcribing file: {error_msg}")
+                    self.transcribe_file_button.configure(state="normal") # 重新啟用按鈕
+                
+                # --- 處理 TTS 狀態 ---
+                elif msg_type == "tts_status_update":
+                    self.update_status(message.get("message", "TTS Status"))
+                    is_done = message.get("done", False)
+                    if is_done:
+                        self.speak_button.configure(state="normal")
+                        # *** 如果不是因為錯誤結束，則嘗試重啟麥克風 ***
+                        if "Error" not in message.get("message", ""):
+                             self.maybe_restart_mic()
+                
+                # --- 處理 LLM 回應 ---
+                elif msg_type == "llm_response":
+                    llm_text = message.get("text", "")
+                    if llm_text:
+                        self.update_status("LLM response received. Preparing TTS...")
+                        # 在右側文本框顯示 LLM 回應
+                        self.translation_textbox.configure(state="normal")
+                        self.translation_textbox.insert("end", f"[LLM] {llm_text}\n")
+                        self.translation_textbox.configure(state="disabled")
+                        self.translation_textbox.see("end")
+
+                        # *** 自動觸發 TTS 播放 ***
+                        # 我們需要一個獨立的方法來觸發 TTS，避免與按鈕回調混淆
+                        # *** 在觸發 TTS 前停止麥克風 ***
+                        self.stop_mic_if_recording() # <--- 新增調用
+                        self.trigger_tts_playback(llm_text)
+                    else:
+                        self.update_status("LLM returned empty response.")
+                        self.maybe_restart_mic() # LLM 回應為空也要重啟麥克風
+                
+                # *** 新增：處理 TTS 播放完成的消息 ***
+                elif msg_type == "tts_playback_finished":
+                    logger.info("TTS playback finished message received.")
+                    self.maybe_restart_mic() # <--- 嘗試重啟麥克風
                 else:
-                     self.process_standard_message(message)
+                    self.process_standard_message(message)
 
         except queue.Empty:
             pass
@@ -285,39 +555,48 @@ class KAudioClientApp(ctk.CTk):
             self.after(100, self.process_gui_queue)
 
     def process_standard_message(self, message):
-         msg_type = message.get("type")
-         if msg_type == "final":
-             text = message.get("text", "")
-             lang = message.get("language", "unk")
-             self.transcript_textbox.configure(state="normal")
-             self.transcript_textbox.insert("end", f"[{lang}] {text}\n")
-             self.transcript_textbox.configure(state="disabled")
-             self.transcript_textbox.see("end")
-             self.transcript_parts.append(text) # 累積文字用於保存和總結
-         elif msg_type == "translation":
-             translated = message.get("translated_text", "")
-             source = message.get("source_lang", "?")
-             target = message.get("target_lang", "?")
-             self.translation_textbox.configure(state="normal")
-             self.translation_textbox.insert("end", f"[{source}->{target}] {translated}\n")
-             self.translation_textbox.configure(state="disabled")
-             self.translation_textbox.see("end")
-         elif msg_type == "info":
-              self.update_status(message.get('message', 'Info'))
-         elif msg_type == "error":
-              error_msg = message.get('message', 'Unknown')
-              self.update_status(f"Error: {error_msg}")
-              # 在兩個文本框都顯示錯誤可能有助於調試
-              self.transcript_textbox.configure(state="normal")
-              self.transcript_textbox.insert("end", f"[ERROR] {error_msg}\n", "error")
-              self.transcript_textbox.configure(state="disabled")
-              self.transcript_textbox.see("end")
-              self.translation_textbox.configure(state="normal")
-              self.translation_textbox.insert("end", f"[ERROR] {error_msg}\n", "error")
-              self.translation_textbox.configure(state="disabled")
-              self.translation_textbox.see("end")
-         else:
-              logger.warning(f"Received unknown message type in queue: {message}")
+        msg_type = message.get("type")
+        text = None
+        if msg_type == "final":
+            text = message.get("text", "")
+            lang = message.get("language", "unk")
+            self.transcript_textbox.configure(state="normal")
+            self.transcript_textbox.insert("end", f"[{lang}] {text}\n")
+            self.transcript_textbox.configure(state="disabled")
+            self.transcript_textbox.see("end")
+            self.transcript_parts.append(text) # 累積文字用於保存和總結
+    
+        # *** 新增：檢查是否在對話模式，如果是則觸發聊天請求 ***
+        if self.conversation_mode_var.get() and text:
+            logger.info("Conversation mode: Triggering LLM chat request.")
+            self.update_status("Sending to LLM...")
+            # 在背景線程執行聊天請求
+            threading.Thread(target=self.run_chat_request_sync, args=(text,), daemon=True).start()
+        elif msg_type == "translation":
+            translated = message.get("translated_text", "")
+            source = message.get("source_lang", "?")
+            target = message.get("target_lang", "?")
+            self.translation_textbox.configure(state="normal")
+            self.translation_textbox.insert("end", f"[{source}->{target}] {translated}\n")
+            self.translation_textbox.configure(state="disabled")
+            self.translation_textbox.see("end")
+        elif msg_type == "info":
+            self.update_status(message.get('message', 'Info'))
+        elif msg_type == "error":
+            error_msg = message.get('message', 'Unknown')
+            self.update_status(f"Error: {error_msg}")
+            # 在兩個文本框都顯示錯誤可能有助於調試
+            self.transcript_textbox.configure(state="normal")
+            self.transcript_textbox.insert("end", f"[ERROR] {error_msg}\n", "error")
+            self.transcript_textbox.configure(state="disabled")
+            self.transcript_textbox.see("end")
+            self.translation_textbox.configure(state="normal")
+            self.translation_textbox.insert("end", f"[ERROR] {error_msg}\n", "error")
+            self.translation_textbox.configure(state="disabled")
+            self.translation_textbox.see("end")
+        
+        else:
+            logger.warning(f"Received unknown message type in queue: {message}")
 
     def show_summary_popup(self, summary_text):
         try:
@@ -356,7 +635,7 @@ class KAudioClientApp(ctk.CTk):
                  print(summary_text)
                  print("----------------------------")
 
-    # *** 新增：顯示文件轉錄結果的彈窗 ***
+    # --- 顯示文件轉錄結果的彈窗 ---
     def show_file_transcription_popup(self, title, result_text):
         popup = ctk.CTkToplevel(self)
         popup.title(title)
@@ -370,6 +649,36 @@ class KAudioClientApp(ctk.CTk):
 
         close_button = ctk.CTkButton(popup, text="Close", command=popup.destroy, font=self.button_font)
         close_button.pack(pady=10)
+
+    # --- 停止和啟動麥克風的方法 ---
+    def stop_mic_if_recording(self):
+        """如果正在錄音，則停止麥克風輸入流"""
+        if self.is_recording and self.audio_stream and self.audio_stream.active:
+            try:
+                logger.info("Temporarily stopping microphone stream for TTS playback.")
+                self.audio_stream.stop()
+                # 不需要 close，只是 stop
+            except Exception as e:
+                 logger.error(f"Error stopping microphone stream: {e}", exc_info=True)
+
+    def maybe_restart_mic(self):
+        """如果處於錄音狀態且流已停止，則重新啟動"""
+        # 只有在用戶沒有手動點擊 Stop 的情況下才重啟
+        if self.is_recording:
+            if self.audio_stream and not self.audio_stream.active:
+                try:
+                    logger.info("Restarting microphone stream after TTS playback.")
+                    self.audio_stream.start()
+                    self.update_status("Microphone restarted. Listening...")
+                except Exception as e:
+                    logger.error(f"Error restarting microphone stream: {e}", exc_info=True)
+                    self.update_status("Error restarting mic. Please stop/start.")
+            elif not self.audio_stream:
+                logger.warning("Cannot restart mic: audio_stream is None.")
+            else: # stream is active
+                logger.debug("Mic stream already active, no need to restart.")
+        else:
+            logger.info("Not restarting mic as recording is stopped.")
 
     # --- 按鈕回調 ---
     def start_recording(self):
@@ -436,6 +745,8 @@ class KAudioClientApp(ctk.CTk):
         self.translation_textbox.configure(state="normal")
         self.translation_textbox.delete("1.0", "end")
         self.translation_textbox.configure(state="disabled")
+        # *** 修改點：禁用對話模式勾選框 ***
+        self.conversation_checkbox.configure(state="disabled")
         self.transcript_parts.clear()
 
         # 重置 stop_event
@@ -451,9 +762,10 @@ class KAudioClientApp(ctk.CTk):
 
     def stop_recording(self):
         logger.info("Stop button clicked.")
-        # *** 修改點：檢查 stop_event 是否存在 ***
-        if self.is_recording and self.stop_event:
-            self.stop_event.set() # 通知異步任務停止
+        # *** 修改點：確保 is_recording 在停止時設置為 False ***
+        self.is_recording = False # <--- 立即設置為 False
+        if self.stop_event: # 檢查是否存在
+            self.stop_event.set()
         # else: # 如果 stop_event 還沒創建就點了 stop (不太可能，但可以加個保護)
         #     logger.warning("Stop clicked but recording not fully started or already stopped.")
 
@@ -486,6 +798,7 @@ class KAudioClientApp(ctk.CTk):
 
     def reset_ui_to_idle(self):
         """將 UI 組件重置回未錄製狀態"""
+        # *** 修改點：確保 is_recording 在這裡也設置為 False ***
         self.is_recording = False
         self.url_entry.configure(state="normal")
         self.device_menu.configure(state="normal")
@@ -493,7 +806,9 @@ class KAudioClientApp(ctk.CTk):
         self.toggle_translation_options() # 根據 checkbox 狀態設置語言框
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
-        # summarize_button 的狀態由 stop_recording 根據是否有內容決定
+        # *** 修改點：確保啟用 Conversation Mode checkbox ***
+        self.conversation_checkbox.configure(state="normal")
+        self.toggle_conversation_mode() # 確保根據其狀態恢復其他 UI
 
     def summarize_transcript(self):
         logger.info("Summarize button clicked.")
@@ -553,8 +868,7 @@ class KAudioClientApp(ctk.CTk):
              # 重新啟用按鈕
              self.gui_queue.put({"type": "enable_summary_button"})
 
-
-    # *** 新增：文件轉錄按鈕的回調 ***
+    # --- 文件轉錄按鈕的回調 ---
     def transcribe_file_button_clicked(self):
         logger.info("Transcribe file button clicked.")
         # 彈出文件選擇對話框
@@ -584,7 +898,7 @@ class KAudioClientApp(ctk.CTk):
         # 在背景線程執行文件上傳和轉錄請求
         threading.Thread(target=self.run_file_transcription_sync, args=(server_http_url, filepath), daemon=True).start()
 
-    # *** 新增：在新線程中執行文件轉錄請求的函數 ***
+    # --- 在新線程中執行文件轉錄請求的函數 ---
     def run_file_transcription_sync(self, server_http_url: str, filepath: str):
         """在新線程中執行同步的文件轉錄請求"""
         transcription_url = f"{server_http_url}/v1/audio/transcriptions"
@@ -630,7 +944,306 @@ class KAudioClientApp(ctk.CTk):
             if files and 'file' in files and hasattr(files['file'][1], 'close'):
                 files['file'][1].close()
 
-    # --- 同步的 HTTP 請求函數 (移入類中) ---
+    # --- TTS 和 Chat 相關方法 ---
+    def synthesize_and_play(self):
+        logger.info("Speak button clicked.")
+        text_to_speak = self.tts_input_textbox.get("1.0", "end-1c").strip() # 獲取文本框內容
+
+        if text_to_speak:
+            # *** 新增：觸發 TTS 前停止麥克風 ***
+            self.stop_mic_if_recording()
+            
+            self.speak_button.configure(state="disabled") # 禁用按鈕防止重複點擊
+            self.trigger_tts_playback(text_to_speak)
+        else:
+            logger.warning("No text entered in TTS input box.")
+            self.update_status("Error: Please enter text to synthesize.")
+
+        selected_voice = self.tts_voice_var.get()
+        if not selected_voice:
+            logger.warning("No voice selected for TTS.")
+            self.update_status("Error: Please select a voice.")
+            return
+
+        self.update_status("Synthesizing audio...")
+        self.speak_button.configure(state="disabled") # 禁用按鈕
+
+        # 獲取伺服器 HTTP URL
+        ws_url = self.url_entry.get().strip()
+        if not ws_url.startswith("ws://"):
+            logger.error("Invalid WebSocket URL for TTS.")
+            self.update_status("Error: Invalid server URL.")
+            self.speak_button.configure(state="normal") # 恢復按鈕
+            return
+        base_url = ws_url.split('/v1/audio/transcriptions/ws')[0]
+        server_http_url = base_url.replace("ws://", "http://", 1)
+
+        # 在背景線程執行 TTS 請求和播放
+        threading.Thread(
+            target=self.run_tts_request_sync,
+            args=(server_http_url, text_to_speak, selected_voice),
+            daemon=True
+        ).start()
+
+    # --- 新增/重構：觸發 TTS 的方法 ---
+    def trigger_tts_playback(self, text_to_speak: str):
+        """觸發 TTS 合成和播放"""
+        selected_voice = self.tts_voice_var.get()
+        if not text_to_speak or not selected_voice or selected_voice in ["Loading...", "Load failed"]:
+            logger.warning(f"Invalid TTS input: Voice='{selected_voice}'")
+            self.update_status("Error: Cannot synthesize - Invalid text or voice.")
+            # 即使 TTS 輸入無效，如果之前停止了 mic，也應該嘗試恢復
+            self.gui_queue.put_nowait({"type": "tts_playback_finished"}) # 發送完成信號以嘗試重啟 mic
+            return
+
+        logger.info("Triggering TTS playback...")
+        self.update_status("Synthesizing audio...")
+        # 這裡可以先禁用按鈕，以防用戶在請求發出前再次點擊
+        # speak_button 的最終狀態由 run_tts_request_sync 通過隊列更新
+        self.speak_button.configure(state="disabled")
+
+        ws_url = self.url_entry.get().strip()
+
+        # --- 錯誤處理：檢查 URL 有效性 ---
+        if not ws_url or not ws_url.startswith("ws://"):
+            error_msg = "Invalid Server WebSocket URL for TTS."
+            logger.error(error_msg)
+            self.update_status(f"Error: {error_msg}")
+            # 發送完成信號，以便 GUI 隊列處理程序可以恢復 Speak 按鈕狀態
+            self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"Error: {error_msg}", "done": True})
+            # 同時也發送播放完成信號，以防萬一需要重啟麥克風
+            self.gui_queue.put_nowait({"type": "tts_playback_finished"})
+            return # 停止執行
+
+        # --- 從 WebSocket URL 推斷 HTTP URL ---
+        try:
+            # 使用更安全的方式分割，避免路徑不匹配時出錯
+            base_url_parts = ws_url.split("/v1/audio/transcriptions/ws")
+            if len(base_url_parts) < 1:
+                 raise ValueError("Cannot parse base URL from WebSocket URL.")
+            base_url = base_url_parts[0]
+            server_http_url = base_url.replace("ws://", "http://", 1) # 只替換第一個 ws://
+        except Exception as e:
+            error_msg = f"Cannot derive HTTP URL from WebSocket URL: {e}"
+            logger.error(error_msg)
+            self.update_status(f"Error: {error_msg}")
+            self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"Error: {error_msg}", "done": True})
+            self.gui_queue.put_nowait({"type": "tts_playback_finished"})
+            return # 停止執行
+
+        # 在背景線程執行 TTS 請求和播放
+        threading.Thread(
+            target=self.run_tts_request_sync,
+            args=(server_http_url, text_to_speak, selected_voice),
+            daemon=True
+        ).start()
+
+    # --- 執行 TTS 請求和播放的函數 ---
+    def run_tts_request_sync(self, server_http_url: str, text: str, voice: str):
+        """在新線程中執行同步的 TTS 請求和流式播放 (假設接收 PCM)"""
+        tts_url = f"{server_http_url}/v1/audio/speech"
+        logger.info(f"Requesting TTS stream from: {tts_url} for voice: {voice}")
+        KOKORO_SAMPLE_RATE = 24000 # Keep assumption for playback for now
+        KOKORO_CHANNELS = 1        # Keep assumption for playback for now
+        stream = None
+        playback_started = False
+
+        try:
+            payload = {
+                "input": text,
+                "voice": voice,
+                # *** FIX 1: Revert response_format to 'wav' ***
+                "response_format": "wav",
+                "model": "kokoro", # Or another model ID accepted by K.audio/Kokoro
+                "speed": 1.0
+            }
+            # Accept header should match requested format
+            headers = {"accept": "audio/wav"}
+
+            with httpx.Client() as client:
+                with client.stream("POST", tts_url, json=payload, headers=headers, timeout=60.0) as response:
+                    # *** FIX 2: Read error response body before accessing text ***
+                    try:
+                        response.raise_for_status() # Check initial status
+                    except httpx.HTTPStatusError as status_error:
+                         # Read the error response body before re-raising or handling
+                         try:
+                             error_body_text = status_error.response.read().decode('utf-8', errors='ignore')
+                         except httpx.ResponseNotRead: # Should not happen after read()
+                             error_body_text = "(Could not read error body)"
+                         except Exception as read_err:
+                             error_body_text = f"(Error reading error body: {read_err})"
+                         # Add detail to the original exception or log it
+                         logger.error(f"HTTP Status Error {status_error.response.status_code} Body: {error_body_text[:500]}")
+                         # Re-raise the original exception to be caught by the outer handler
+                         raise status_error
+
+                    # --- If status is OK (2xx), proceed with streaming ---
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "audio/wav" not in content_type: # Check if we actually got WAV
+                         # Handle unexpected content type if necessary, but proceed assuming it might be playable
+                         logger.warning(f"Received Content-Type '{content_type}', attempting to process as WAV stream.")
+                         # raise ValueError(f"Expected audio/wav, but received {content_type}")
+
+                    logger.info("Receiving streaming audio data...")
+                    self.gui_queue.put_nowait({"type": "tts_status_update", "message": "Receiving audio stream..."})
+
+                    byte_iterator = response.iter_bytes(chunk_size=1024 * 2) # Read 2KB chunks
+
+                    # *** Revert: Assume WAV stream, parse header again ***
+                    header_bytes_needed = 44
+                    wav_header = b''
+                    header_parsed = False
+                    sample_rate = KOKORO_SAMPLE_RATE # Default if header parsing fails
+                    n_channels = KOKORO_CHANNELS    # Default if header parsing fails
+
+                    while len(wav_header) < header_bytes_needed:
+                        try:
+                            chunk = next(byte_iterator)
+                            wav_header += chunk
+                        except StopIteration:
+                            raise ValueError("Incomplete WAV header received (stream ended unexpectedly).")
+
+                    header_data = wav_header[:header_bytes_needed]
+                    remainder = wav_header[header_bytes_needed:]
+
+                    try:
+                        with io.BytesIO(header_data) as header_f:
+                            with wave.open(header_f, 'rb') as wf:
+                                sample_rate = wf.getframerate()
+                                n_channels = wf.getnchannels()
+                                sampwidth = wf.getsampwidth()
+                                logger.info(f"WAV properties from stream header: Rate={sample_rate}, Channels={n_channels}, Width={sampwidth}")
+                                if sampwidth != 2:
+                                    raise ValueError(f"Unsupported sample width: {sampwidth}")
+                                # Update channels based on header
+                                KOKORO_CHANNELS = n_channels
+                        header_parsed = True
+                    except wave.Error as e:
+                        logger.warning(f"Could not parse WAV header from stream ({e}), falling back to default parameters ({KOKORO_SAMPLE_RATE} Hz, {KOKORO_CHANNELS} Ch). Data might be raw PCM.")
+                        # If header parsing fails, treat *all* received data (including header bytes) as audio
+                        remainder = wav_header # Treat the whole header buffer as audio start
+
+                    # Create and start output stream
+                    stream = sd.OutputStream(
+                        samplerate=sample_rate, # Use parsed or default rate
+                        channels=n_channels,    # Use parsed or default channels
+                        dtype=DTYPE,
+                        blocksize=1024
+                    )
+                    stream.start()
+                    playback_started = True
+                    logger.info(f"Audio output stream started at {sample_rate} Hz.")
+                    self.gui_queue.put_nowait({"type": "tts_status_update", "message": "Playing audio stream..."})
+
+                    # Write remainder
+                    if remainder:
+                         audio_chunk_np = np.frombuffer(remainder, dtype=DTYPE)
+                         stream.write(audio_chunk_np)
+
+                    # Iterate and play rest
+                    for chunk in byte_iterator:
+                        if chunk:
+                            audio_chunk_np = np.frombuffer(chunk, dtype=DTYPE)
+                            stream.write(audio_chunk_np)
+
+                    logger.info("Finished writing audio stream to sounddevice.")
+                    self.gui_queue.put_nowait({"type": "tts_status_update", "message": "TTS stream finished.", "done": True})
+
+        # --- Error Handling ---
+        except httpx.HTTPStatusError as e:
+             # Error body was read above (or attempted)
+             error_detail = error_body_text if 'error_body_text' in locals() else f"(Status: {e.response.status_code})"
+             logger.error(f"HTTP error during TTS stream request: {e.response.status_code} - {error_detail}")
+             self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"TTS Server Error: {e.response.status_code}", "done": True})
+        except httpx.RequestError as e: ... # Keep as is
+        except (wave.Error, ValueError) as e: # Keep as is
+             logger.error(f"Error processing WAV stream data: {e}")
+             self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"Error: Invalid audio data - {e}", "done": True})
+        except sd.PortAudioError as e: ... # Keep as is
+        except Exception as e: ... # Keep as is
+        finally:
+            # ... (Close stream, send tts_playback_finished) ...
+            if stream: ...
+            self.gui_queue.put_nowait({"type": "tts_playback_finished"})
+
+    # --- 執行聊天請求的函數 (在線程中運行) ---
+    def run_chat_request_sync(self, transcript_text: str):
+        """在新線程中執行同步的 LLM 聊天請求"""
+        # *** 修改點：從 UI 或默認值獲取模型名稱 ***
+        # 這裡我們暫時硬編碼一個值，理想情況下應來自配置或 UI
+        llm_model_name = "Qwen3-30B-A3B-UD-IQ1_S" # 或者 self.llm_model_entry.get() (如果添加了輸入框)
+        # 獲取伺服器 HTTP URL
+        ws_url = self.url_entry.get().strip()
+        if not ws_url.startswith("ws://"):
+            logger.error("Invalid WebSocket URL for chat request.")
+            self.gui_queue.put_nowait({"type":"tts_status_update", "message":"Error: Invalid server URL"})
+            return
+        base_url = ws_url.split('/v1/audio/transcriptions/ws')[0]
+        server_http_url = base_url.replace("ws://", "http://", 1)
+        chat_url = f"{server_http_url}/v1/chat/completions"
+
+        logger.info(f"Requesting LLM Chat completion from: {chat_url}")
+
+        try:
+            system_prompt = """
+You are an AI voice chat assistant. Your primary function is to interact with the user in a natural, conversational manner suitable for a real-time voice exchange.
+
+**Core Directives:**
+
+1.  **Conversational Tone:** Respond as if you are speaking directly to the user in a friendly, natural chat. Use simple, clear language.
+2.  **Conciseness:** Keep your answers brief and to the point. Voice interactions require clarity and brevity. Avoid lengthy explanations or unnecessary filler words.
+3.  **Accuracy:** Ensure the information you provide is correct and directly addresses the user's query.
+4.  **Direct Answers:** Provide the requested information or response directly. **Crucially, do NOT output your reasoning, thought process, search steps, or any meta-commentary about how you arrived at the answer.** Your response should solely consist of the concise, accurate, and conversational answer itself.
+
+**Example Interaction:**
+
+* **User:** "What's the weather like in Taipei today?"
+* **Your Ideal Response (Concise, Direct, Conversational):** "It's currently sunny and warm in Taipei, around 28 degrees Celsius."
+* **Avoid Responses Like:** "Okay, let me check the weather for Taipei. According to my sources, the weather in Taipei today is sunny with a high of 28 degrees Celsius. I found this information by accessing a weather API..."
+
+Maintain this style consistently across all interactions. Act as a helpful, efficient, and conversational voice assistant.
+""".strip()
+            # 構建請求體
+            payload = {
+                "model": llm_model_name, # 使用變量
+                "messages": [
+                    {
+                        "role": "system", 
+                        "content": system_prompt
+                        },
+                    {"role": "user", "content": transcript_text + "/no_think"}
+                ],
+                "temperature": 0.7, # 可以調整
+                "max_tokens": 150, # 可以限制回復長度
+            }
+            with httpx.Client() as client:
+                response = client.post(chat_url, json=payload, timeout=120.0)
+                response.raise_for_status()
+                result = response.json()
+
+            # 提取 LLM 回應
+            if result.get("choices") and result["choices"][0].get("message") and result["choices"][0]["message"].get("content"):
+                 llm_response_text = result["choices"][0]["message"]["content"].strip()
+                 logger.info(f"LLM response received: {llm_response_text[:100]}...")
+                 # 將結果放入 GUI 隊列
+                 self.gui_queue.put_nowait({"type": "llm_response", "text": llm_response_text})
+            else:
+                 logger.error(f"Invalid LLM response format: {result}")
+                 self.gui_queue.put_nowait({"type": "tts_status_update", "message": "Error: Invalid LLM response"})
+
+        except httpx.HTTPStatusError as e:
+             error_detail = e.response.text[:200]
+             logger.error(f"HTTP error during chat request: {e.response.status_code} - {error_detail}")
+             self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"LLM Server Error: {e.response.status_code}"})
+        except httpx.RequestError as e:
+             logger.error(f"Request error during chat request: {e}")
+             self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"LLM Connection Error: {e}"})
+        except Exception as e:
+             logger.error(f"Unexpected error during chat request: {e}", exc_info=True)
+             self.gui_queue.put_nowait({"type": "tts_status_update", "message": f"Chat Request Error: {e}"})
+
+    # --- 同步的 HTTP 請求 ---
     def request_summarization_sync(self, server_http_url: str, text: str) -> str | None:
         """(同步) 向 K.audio 伺服器請求文本摘要"""
         summarization_url = f"{server_http_url}/v1/summarizations"
@@ -683,7 +1296,6 @@ class KAudioClientApp(ctk.CTk):
         finally:
              if loop:
                  loop.close()
-
 
     async def websocket_logic(self, ws_url, device_index, translate, target_lang, source_lang):
         """實際的 WebSocket 連接、音訊流和任務管理"""
@@ -794,7 +1406,6 @@ class KAudioClientApp(ctk.CTk):
             if not self.stop_event.is_set():
                  self.gui_queue.put_nowait({"type": "force_stop_ui"})
 
-
     # --- sender 和 receiver 作為類的方法 ---
     async def sender(self, websocket):
         """從隊列中獲取音訊數據並通過 WebSocket 發送"""
@@ -833,7 +1444,6 @@ class KAudioClientApp(ctk.CTk):
             logger.error(f"Unexpected error in sender task: {e}", exc_info=True)
         finally:
             logger.info("Sender task finished.")
-
 
     async def gui_receiver(self, websocket):
         """接收 WebSocket 消息並放入 GUI 隊列"""

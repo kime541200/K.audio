@@ -33,6 +33,9 @@ services:
       - TZ=Asia/Taipei
       # --- LLM Settings (在這裡設置需要的值) ---
       - LOCAL_LLM_API_BASE=http://192.168.1.103:1000/v1 # <--- 在這裡設置 LLM URL
-      - LOCAL_LLM_MODEL_NAME=Qwen3-30B-A3B-UD-Q4_K_XL # <--- 在這裡設置模型名稱
+      - LOCAL_LLM_MODEL_NAME=Qwen3-30B-A3B-UD-IQ1_S # <--- 在這裡設置模型名稱
       - LOCAL_LLM_API_KEY=${LOCAL_LLM_API_KEY:-DUMMY_KEY} # 可以保持預設或允許外部環境變數覆蓋
+      # --- 新增: TTS Service Settings ---
+      - TTS_SERVICE_API_BASE=${TTS_SERVICE_API_BASE:-http://192.168.1.103:8880} # <--- 使用您提供的 IP 和端口作為示例
+
     restart: unless-stopped

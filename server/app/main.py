@@ -19,6 +19,8 @@ from .services.stt_service import load_stt_model, unload_stt_model, stt_model # 
 # 導入 API 路由
 from .api.v1 import audio as api_v1_audio
 from .api.v1 import summarize as api_v1_summarize
+from .api.v1 import tts as api_v1_tts
+from .api.v1 import chat as api_v1_chat 
 
 # 配置日誌
 logging.basicConfig(level=logging.INFO)
@@ -74,6 +76,8 @@ app = FastAPI(
 # --- 包含 API 路由 ---
 app.include_router(api_v1_audio.router)
 app.include_router(api_v1_summarize.router)
+app.include_router(api_v1_tts.router)
+app.include_router(api_v1_chat.router)
 
 
 ####################

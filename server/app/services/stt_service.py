@@ -22,11 +22,13 @@ stt_model: WhisperModel | None = None
 
 
 # --- 可以在類別或函數開頭定義這些常數，方便調整 ---
-DEFAULT_TEMPERATURE = 0.0 # 或 (0.0, 0.2, 0.4)
-DEFAULT_NO_SPEECH_THRESHOLD = 0.7 # 提高此值以更嚴格判定語音 (預設 ~0.6)
-DEFAULT_LOG_PROB_THRESHOLD = -0.8 # 提高此值以過濾低概率結果 (預設 -1.0)
-FILTER_NO_SPEECH_PROB_THRESHOLD = 0.6 # 用於後處理過濾
-FILTER_AVG_LOGPROB_THRESHOLD = -1.0 # 用於後處理過濾 (可設為與上面 log_prob_threshold 一樣或稍寬鬆)
+DEFAULT_TEMPERATURE = 0.0
+# DEFAULT_NO_SPEECH_THRESHOLD = 0.7 # 無法傳遞給 numpy 輸入的 transcribe
+# DEFAULT_LOG_PROB_THRESHOLD = -0.8 # 無法傳遞給 numpy 輸入的 transcribe
+
+# *** 主要修改這裡：調整後處理閾值 ***
+FILTER_NO_SPEECH_PROB_THRESHOLD = 0.85 # 大幅提高此值 (例如設為 0.8 / 0.85 / 0.9)
+FILTER_AVG_LOGPROB_THRESHOLD = -1.2    # 可以稍微降低此值 (更寬鬆)，避免誤殺
 # 常見幻覺詞列表 (可自行擴充)
 COMMON_HALLUCINATIONS = [
     "Thank you for watching",

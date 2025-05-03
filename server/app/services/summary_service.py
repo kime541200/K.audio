@@ -1,7 +1,8 @@
 import logging
-from openai import AsyncOpenAI # 使用異步客戶端
-import asyncio
 import re
+from openai import AsyncOpenAI, OpenAIError # <--- 導入 OpenAIError
+from typing import Dict, Any, Optional
+import httpx # <-- 添加導入 httpx 以便在代理函數中使用
 
 from ..core.config import settings
 
@@ -67,7 +68,6 @@ async def get_summary_from_llm(text: str) -> str | None:
     except Exception as e:
         logger.error(f"Error calling LLM API: {e}", exc_info=True)
         return None
-
 
 # --- 翻譯函數 ---
 async def get_translation_from_llm(text: str, source_lang: str, target_lang: str) -> str | None:
@@ -160,4 +160,50 @@ Target Language: [Specify the target language here, e.g., English, Japanese, Fre
 
     except Exception as e:
         logger.error(f"Error calling LLM API for translation: {e}", exc_info=True)
+        return None
+    
+# --- 新增：代理聊天請求的函數 ---
+async def proxy_chat_request(payload: Dict[str, Any]) -> Optional[httpx.Response]:
+    """
+    將 Chat Completion 請求轉發給配置的本地 LLM 服務。
+
+    Args:
+        payload: 兼容 OpenAI Chat Completion API 的請求體字典。
+
+    Returns:
+        httpx.Response 對象如果成功，否則返回 None。
+    """
+    if client is None: # 雖然我們直接用 httpx，但可以保留對 client 初始化狀態的檢查
+        logger.error("OpenAI client (config check) is not initialized. Cannot proxy chat.")
+        # return None # 或者即使 client 用於其他地方，這裡仍然可以嘗試用 httpx
+        pass # 繼續嘗試用 httpx
+
+    # 目標 URL 指向 LLM 的 chat/completions 端點
+    target_url = f"{settings.local_llm_api_base}/chat/completions"
+    logger.info(f"Proxying Chat request to: {target_url}")
+    # logger.debug(f"Chat Payload: {payload}")
+
+    headers = {
+        "Content-Type": "application/json",
+        "accept": "application/json"
+    }
+    if settings.local_llm_api_key and settings.local_llm_api_key != "DUMMY_KEY":
+        headers["Authorization"] = f"Bearer {settings.local_llm_api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as http_client: # 給 LLM 較長超時
+            # 直接轉發 payload
+            response = await http_client.post(
+                target_url,
+                json=payload,
+                headers=headers
+            )
+        logger.info(f"Received response from LLM service with status code: {response.status_code}")
+        return response
+
+    except httpx.RequestError as e:
+        logger.error(f"Error requesting LLM service at {target_url}: {e}", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during LLM proxy request: {e}", exc_info=True)
         return None
