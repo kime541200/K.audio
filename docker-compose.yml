@@ -4,7 +4,7 @@ services:
       context: ./server
       dockerfile: Dockerfile
     image: k-audio
-    container_name: k_audio_server_container
+    container_name: k-audio-server
     ports:
       - "8000:8000"
     volumes:
